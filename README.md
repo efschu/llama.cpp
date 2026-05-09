@@ -18,7 +18,7 @@ Here's a [plug-and-play Qwen 3.6 27B setup](docs/quickstart-qwen36-dflash.md) wi
 - **Sampled DFlash verification**: `--spec-draft-temp` enables rejection-sampling drafter behavior. Activates when both draft and target temperature exceed zero. Draft log probabilities must be available for rejection sampling to produce correct output.
 - **DDTree branch verification**: optional `--spec-branch-budget` adds branch nodes beyond the main draft path with GPU `parent_ids`, tree masks, and recurrent tree kernels. Disabled automatically when the target model spans more than one GPU. This one is very much work in progress!
 - **Request-level speculative overrides**: Draft-max and branch budget can be overridden per-request through JSON fields without restarting the server.
-- **CopySpec model-free speculation**: `--spec-type copyspec` provides rolling-hash suffix matching over previous tokens without a draft model. Results must be benchmarked per workload.
+- **CopySpec model-free speculation**: `--spec-type copyspec` provides rolling-hash suffix matching over previous tokens without a draft model.
 
 For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
 
