@@ -4,18 +4,6 @@ BeeLlama.cpp is a llama.cpp fork for people who want the current llama.cpp runti
 
 The short feature list is below. For full command-line tuning, including upstream llama.cpp args, DFlash args, TurboQuant/TCQ cache choices, context checkpoints, prompt-cache RAM, chat/reasoning controls, and launch examples, read [beellama-args.md](beellama-args.md).
 
-## Public Comparison Baselines
-
-Checked on 2026-05-06 against GitHub `master` refs:
-
-| Repository | Public ref checked | Commit |
-| --- | --- | --- |
-| `ggml-org/llama.cpp` | `master` | `a0101225bc60908572ed8b4dfd2ee1a61c69b689` |
-| `TheTom/llama-cpp-turboquant` | `master` | `57f6b936574f89bd7b46bbd5c317b5bf0b744321` |
-| `spiritbuun/buun-llama-cpp` | `master` | `6575873e9c4872709d374d854b583cfaa270caff` |
-
-The BeeLlama tree used for this page is `d8af2fce3`.
-
 ## Strong Feature List
 
 BeeLlama's practical advantage is combination. Public llama.cpp has the main runtime, public TheTom has classic TurboQuant work, and public buun has DFlash/TCQ work. BeeLlama brings those lines together and adds server-facing controls that are not present in the checked public refs.
