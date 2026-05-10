@@ -9,6 +9,7 @@
 #endif
 
 #include <cmath>
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <string>
