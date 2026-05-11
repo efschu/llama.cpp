@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.1
+
+- Improved agentic tool-call reliability with lazy grammars. DFlash now remains enabled before a lazy grammar trigger, but stops speculating once grammar-constrained output or reasoning-budget forcing requires normal token-by-token sampling.
+- Fixed DFlash accept bookkeeping at grammar and tool-call boundaries. The server now distinguishes accepted draft tokens from bonus-token-shaped results, updates DFlash hidden-state rows with the root plus accepted draft tokens, and uses the same keep count for rollback.
+- Added a DFlash suppression guard for raw tool-call markers. When a tool marker appears while lazy grammar is enabled, the server suppresses DFlash for the rest of that response without steering sampler state; fenced code and embedded marker-like strings are excluded from the guard.
+- Made partial OpenAI-compatible tool-call streaming safer. The server can stream a stable tool name/id early so clients can show a pending tool call, while withholding partial arguments until the parser sees a complete call.
+- Quarantined malformed raw tool-call text in tool-parsing streams. Unfinished or malformed tool-looking text no longer leaks into visible assistant content or hidden reasoning deltas before the parser can classify it.
+- Accepted direct tag-style function starts for Qwen-style tool calls. Lazy grammar triggers now include structural function markers such as `<function=`, and the tag parser can parse valid direct function calls without the outer `<tool_call>` wrapper.
+- Added regression coverage for Kimi and Qwen tool-call streaming, malformed raw marker quarantine, fenced-code false positives, direct Qwen function calls, lazy grammar triggers, and DFlash speculative boundary plumbing.
+- Fixed small build issues found after 0.1.0: the DFlash callback setup now uses an explicit callback type for GCC 15, and tests/server code include the required standard headers for `INT_MAX` and `FLT_MAX`.
+
 ## v0.1.0
 
 - DFlash speculative decoding: `--spec-type dflash` drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a per-layer 4096-slot ring buffer, the drafter cross-attends to the most recent `--spec-dflash-cross-ctx` hidden-state tokens and proposes drafts for target verification.
