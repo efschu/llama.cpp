@@ -403,8 +403,38 @@ extern "C" const float * dflash_cross_ring_gpu_interleave(
 extern "C" void dflash_cross_ring_gpu_set_tensor(
         void * d_dst, const void * d_src, size_t offset, size_t size) {
     if (!d_dst || !d_src || size == 0) return;
-    cudaMemcpyAsync((char *)d_dst + offset, d_src, size,
-                     cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+
+    char * dst = (char *) d_dst + offset;
+
+    cudaPointerAttributes dst_attr;
+    cudaError_t dst_err = cudaPointerGetAttributes(&dst_attr, dst);
+    if (dst_err != cudaSuccess) {
+        cudaGetLastError();
+    }
+
+    cudaPointerAttributes src_attr;
+    cudaError_t src_err = cudaPointerGetAttributes(&src_attr, d_src);
+    if (src_err != cudaSuccess) {
+        cudaGetLastError();
+    }
+
+#if CUDART_VERSION >= 10000
+    const bool dst_is_device = dst_err == cudaSuccess && dst_attr.type == cudaMemoryTypeDevice;
+    const bool src_is_device = src_err == cudaSuccess && src_attr.type == cudaMemoryTypeDevice;
+#else
+    const bool dst_is_device = dst_err == cudaSuccess && dst_attr.memoryType == cudaMemoryTypeDevice;
+    const bool src_is_device = src_err == cudaSuccess && src_attr.memoryType == cudaMemoryTypeDevice;
+#endif
+
+    if (dst_is_device && src_is_device && dst_attr.device != src_attr.device) {
+        cudaSetDevice(dst_attr.device);
+        cudaMemcpyPeerAsync(dst, dst_attr.device, d_src, src_attr.device, size, cudaStreamPerThread);
+    } else {
+        if (dst_is_device) {
+            cudaSetDevice(dst_attr.device);
+        }
+        cudaMemcpyAsync(dst, d_src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    }
     cudaStreamSynchronize(cudaStreamPerThread);
 }
 

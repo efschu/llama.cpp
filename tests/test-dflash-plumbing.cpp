@@ -101,6 +101,20 @@ int main(int argc, char ** argv) {
     ok &= expect(dflash_draft.find("llm_build_dflash_kv_update::llm_build_dflash_kv_update") != std::string::npos, "DFlash K/V update graph builder must exist");
     ok &= expect(context_cpp.find("dflash_kv_cache_prepare((int) cross.n_enc)") != std::string::npos, "DFlash set_cross_data_gpu must expose cached K/V for the active window");
     ok &= expect(context_cpp.find("n_layers * 2 + 8") != std::string::npos, "DFlash K/V cache must not allocate duplicate staging tensors");
+    const size_t kv_cache_init_fn = context_cpp.find("bool llama_context::dflash_kv_cache_init");
+    const size_t kv_cache_update_fn = context_cpp.find("bool llama_context::dflash_kv_cache_update");
+    const size_t kv_cache_update_graph = context_cpp.find("ggml_backend_graph_compute_async(gpu_backend, gf)", kv_cache_update_fn);
+    ok &= expect(context_h.find("dflash_kv_cache_multi_gpu_fallback_logged") != std::string::npos, "DFlash K/V cache multi-GPU fallback logging must be per context");
+    ok &= expect(
+        kv_cache_init_fn != std::string::npos &&
+        kv_cache_update_fn != std::string::npos &&
+        context_cpp.find("multi-GPU drafter detected", kv_cache_init_fn) < kv_cache_update_fn,
+        "DFlash drafter K/V cache must fall back before initializing on multi-GPU draft placement");
+    ok &= expect(
+        kv_cache_update_fn != std::string::npos &&
+        kv_cache_update_graph != std::string::npos &&
+        context_cpp.find("model.n_devices() > 1", kv_cache_update_fn) < kv_cache_update_graph,
+        "DFlash K/V cache update must not compute a split drafter graph on one CUDA backend");
     ok &= expect(speculative.find("llama_dflash_kv_cache_update_from_ring(ctx_dft, gpu_ring_handle") != std::string::npos, "DFlash accepted hiddens must update K/V cache from the GPU ring without mutating cross state");
     ok &= expect(context_cpp.find("dflash_kv_update_gpu") != std::string::npos, "DFlash K/V update must use a temporary input source separate from the main cross state");
     ok &= expect(cuda_cpp.find("dflash_kv_update") != std::string::npos, "DFlash K/V update graph must be excluded from CUDA graph capture");
@@ -134,6 +148,8 @@ int main(int argc, char ** argv) {
     ok &= expect(context_cpp.find("const bool dflash_graph_tape_ready") != std::string::npos, "DFlash decode must gate GPU tape copies separately from hidden capture");
     ok &= expect(context_cpp.find("dflash_graph_hidden_ready =\n                    !dflash_capture->hidden_gpu.empty()") != std::string::npos, "GPU hidden graph capture must not depend on active tape recording");
     ok &= expect(context_cpp.find("dflash_tape_gpu * graph_tp = dflash_graph_tape_ready ? tp : nullptr") != std::string::npos, "GPU tape graph pointers must be disabled when tape recording is inactive");
+    ok &= expect(context_cpp.find("multi-GPU target detected") != std::string::npos, "multi-GPU target must fall back from graph-embedded DFlash GPU capture");
+    ok &= expect(context_cpp.find("const bool dflash_gpu_capture_ready = model.n_devices() <= 1") != std::string::npos, "DFlash graph capture must be gated to single-GPU target placement");
     ok &= expect(context_cpp.find("buf.n_tokens <= 0 || buf.data.empty()") != std::string::npos, "empty CPU hidden buffers must not mask GPU hidden buffers");
     ok &= expect(context_cpp.find("hidden->n_tokens = 0") != std::string::npos, "GPU hidden token counts must reset between decodes");
     ok &= expect(context_cpp.find("ggml_backend_tensor_get(tensor, staging.data()") != std::string::npos, "GPU hidden D2D fallback must preserve correctness via readback");
@@ -150,6 +166,12 @@ int main(int argc, char ** argv) {
     const size_t sync_in_set_tensor = cuda_ring.find("cudaStreamSynchronize", set_tensor_fn);
     ok &= expect(sync_in_set_tensor != std::string::npos && sync_in_set_tensor < set_tensor_end,
         "dflash_cross_ring_gpu_set_tensor must synchronize before GGML backend-stream graph reads");
+    ok &= expect(
+        set_tensor_fn != std::string::npos &&
+        set_tensor_end != std::string::npos &&
+        cuda_ring.find("cudaPointerGetAttributes(&dst_attr", set_tensor_fn) < set_tensor_end &&
+        cuda_ring.find("cudaMemcpyPeerAsync", set_tensor_fn) < set_tensor_end,
+        "dflash_cross_ring_gpu_set_tensor must handle cross-device D2D copies explicitly");
     ok &= expect(context_h.find("tape_replay_conv_gpu") != std::string::npos, "DFlash must declare GPU conv rebuild fast path");
     ok &= expect(context_cpp.find("tape_replay_conv_gpu(mem_recurrent, cell_idx, n_accepted)") != std::string::npos, "conv replay must try GPU rebuild before CPU fallback");
     ok &= expect(context_cpp.find("conv_gpu_enqueue=%.3f ms") != std::string::npos, "DFlash profile must report GPU conv enqueue time");

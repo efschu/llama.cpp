@@ -141,6 +141,7 @@ struct dflash_capture_data {
 
     // Opt-in DFlash profiling (GGML_DFLASH_PROFILE=1).
     bool profile = false;
+    bool multi_gpu_capture_fallback_logged = false;
     uint64_t profile_decode_us = 0;
     uint64_t profile_raw_logits_us = 0;
     uint64_t profile_raw_logits_bytes = 0;
@@ -680,6 +681,7 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
+    bool dflash_kv_cache_multi_gpu_fallback_logged = false;
     std::unique_ptr<dflash_kv_cache_data> dflash_kv_cache;
 
     llm_graph_result_ptr gf_res_prev;

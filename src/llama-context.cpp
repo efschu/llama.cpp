@@ -1554,10 +1554,23 @@ void llama_context::allocate_tape_gpu(int n_slots, int max_tokens) {
             }
         }
     }
-    allocate_hidden_gpu(n_slots, max_tokens);
 
     // populate recurrent-layer metadata if the caller beat set_tape_recording() to it
     dflash_ensure_recurrent_setup();
+
+    if (model.n_devices() > 1) {
+        dflash_capture->hidden_gpu.clear();
+        dflash_capture->tapes.clear();
+        if (!dflash_capture->multi_gpu_capture_fallback_logged) {
+            LLAMA_LOG_INFO("%s: multi-GPU target detected (%zu devices); using eval-callback DFlash capture/tape fallback\n",
+                __func__, model.n_devices());
+            dflash_capture->multi_gpu_capture_fallback_logged = true;
+        }
+        return;
+    }
+
+    allocate_hidden_gpu(n_slots, max_tokens);
+
     if (dflash_capture->recurrent_layer_ids.empty()) {
         return;
     }
@@ -1659,6 +1672,10 @@ void llama_context::allocate_hidden_gpu(int n_slots, int max_tokens) {
     }
     if (n_slots < 1) {
         n_slots = 1;
+    }
+    if (model.n_devices() > 1) {
+        dflash_capture->hidden_gpu.clear();
+        return;
     }
     if (!llama_dflash_gpu_tape_supported_arch(model.arch)) {
         dflash_capture->hidden_gpu.clear();
@@ -2668,6 +2685,16 @@ bool llama_context::dflash_kv_cache_init(int ctx_size) {
     if (ctx_size <= 0 || model.arch != LLM_ARCH_DFLASH_DRAFT) {
         return false;
     }
+    if (model.n_devices() > 1) {
+        dflash_kv_cache.reset();
+        cross.dflash_kv_cache = nullptr;
+        if (!dflash_kv_cache_multi_gpu_fallback_logged) {
+            LLAMA_LOG_INFO("%s: multi-GPU drafter detected (%zu devices); disabling DFlash drafter K/V projection cache because updates run on a single CUDA backend\n",
+                __func__, model.n_devices());
+            dflash_kv_cache_multi_gpu_fallback_logged = true;
+        }
+        return false;
+    }
     if (dflash_kv_cache && dflash_kv_cache->ring_size == ctx_size) {
         return true;
     }
@@ -2789,6 +2816,11 @@ bool llama_context::dflash_kv_cache_prepare(int ctx_window) {
 
 bool llama_context::dflash_kv_cache_update(int n_tokens) {
     if (!dflash_kv_cache || n_tokens <= 0 || model.arch != LLM_ARCH_DFLASH_DRAFT) {
+        return false;
+    }
+    if (model.n_devices() > 1) {
+        dflash_kv_cache.reset();
+        cross.dflash_kv_cache = nullptr;
         return false;
     }
     if (!cross.dflash_kv_update_gpu && !cross.v_embd_gpu && cross.v_embd.empty()) {
@@ -4202,6 +4234,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // correct layer_hiddens slot. Populate per-seq tape pointers for the
         // graph builder so GPU tape copies target the correct per-slot buffers.
         if (dflash_capture) {
+            const bool dflash_gpu_capture_ready = model.n_devices() <= 1;
             dflash_capture->ubatch = &ubatch;
             cparams.hidden_gpu_n_seqs = 0;
             for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
@@ -4213,6 +4246,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (!dflash_capture->tapes.empty()) {
                 const int ns = std::min((int) ubatch.n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
                 const bool dflash_graph_tape_ready =
+                    dflash_gpu_capture_ready &&
                     dflash_capture->tape_enabled &&
                     ubatch.n_seq_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
                 const int tape_ns = dflash_graph_tape_ready ? ns : 0;
@@ -4220,6 +4254,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 bool seqs_changed = (tape_ns != cparams.tape_gpu_n_seqs);
                 dflash_graph_hidden_ready =
                     !dflash_capture->hidden_gpu.empty() &&
+                    dflash_gpu_capture_ready &&
                     !tree_bufs.active &&
                     ubatch.n_seq_tokens <= LLAMA_DFLASH_MAX_VERIFY_TOKENS;
 
