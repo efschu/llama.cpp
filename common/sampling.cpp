@@ -111,6 +111,7 @@ struct ring_buffer {
 struct common_sampler {
     common_params_sampling params;
 
+    const llama_vocab * vocab;
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
     struct llama_sampler * chain;
@@ -410,6 +411,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     auto * result = new common_sampler {
         /* .params  = */ params,
+        /* .vocab   = */ vocab,
         /* .grmr    = */ grmr,
         /* .rbudget = */ rbudget,
         /* .chain   = */ chain,
@@ -451,6 +453,28 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
+static bool reasoning_budget_is_active(common_reasoning_budget_state state) {
+    return state == REASONING_BUDGET_COUNTING || state == REASONING_BUDGET_WAITING_UTF8;
+}
+
+static bool common_sampler_force_reasoning_end_on_eog(struct common_sampler * gsmpl, llama_token id) {
+    if (!gsmpl || !gsmpl->rbudget || !gsmpl->vocab || id == LLAMA_TOKEN_NULL) {
+        return false;
+    }
+    if (!llama_vocab_is_eog(gsmpl->vocab, id)) {
+        return false;
+    }
+    if (!reasoning_budget_is_active(common_reasoning_budget_get_state(gsmpl->rbudget))) {
+        return false;
+    }
+    if (!common_reasoning_budget_force_end(gsmpl->rbudget)) {
+        return false;
+    }
+
+    LOG_WRN("%s: sampled EOG while reasoning is active; forcing reasoning end sequence instead\n", __func__);
+    return true;
+}
+
 void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated) {
     if (!gsmpl) {
         return;
@@ -485,6 +509,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
         /* .params  = */ gsmpl->params,
+        /* .vocab   = */ gsmpl->vocab,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
@@ -616,6 +641,14 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+
+    if (common_sampler_force_reasoning_end_on_eog(gsmpl, id)) {
+        gsmpl->set_logits(ctx, idx);
+        llama_sampler_apply(rbudget, &cur_p);
+        llama_sampler_apply(chain, &cur_p);
+        GGML_ASSERT(cur_p.selected != -1 && "no selected token during reasoning-end repair");
+        id = cur_p.data[cur_p.selected].id;
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
@@ -767,7 +800,12 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
         GGML_ASSERT(gsmpl->cur_p.selected >= 0 && "no selected token during reduced sampling");
         GGML_ASSERT((size_t) gsmpl->cur_p.selected < gsmpl->cur_p.size);
 
-        return gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+        const llama_token id = gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
+        if (common_sampler_force_reasoning_end_on_eog(gsmpl, id)) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        return id;
     };
 
     std::vector<llama_token> result;
