@@ -48,6 +48,8 @@ int main(int argc, char ** argv) {
     const std::string sampling_h = read_file(root + "/common/sampling.h");
     const std::string sampling_cpp = read_file(root + "/common/sampling.cpp");
     const std::string server_context = read_file(root + "/tools/server/server-context.cpp");
+    const std::string server_task = read_file(root + "/tools/server/server-task.cpp");
+    const std::string chat_auto_parser_generator = read_file(root + "/common/chat-auto-parser-generator.cpp");
     const std::string speculative = read_file(root + "/common/speculative.cpp");
     const std::string dflash_draft = read_file(root + "/src/models/dflash_draft.cpp");
     const std::string memory_recurrent = read_file(root + "/src/llama-memory-recurrent.cpp");
@@ -188,11 +190,34 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_argmax.find("const float raw_logit = heap_idx[i] >= 0 ? rowx[heap_idx[i]] : -FLT_MAX;") != std::string::npos, "CUDA deterministic top-K must return raw logits, not zero scores");
     ok &= expect(cuda_argmax.find("cub::DeviceTopK::MaxPairs") != std::string::npos, "CUDA deterministic top-K must use CUB fast path when available");
     ok &= expect(sampling_h.find("common_sampler_sample_reduced_and_accept_n") != std::string::npos, "common sampler must expose reduced-candidate verifier sampling");
+    ok &= expect(sampling_h.find("common_sampler_blocks_speculative") != std::string::npos, "common sampler must expose grammar/reasoning guard for speculative decoding");
+    ok &= expect(sampling_cpp.find("Lazy grammars are safe to speculate while still awaiting their trigger") != std::string::npos, "speculative guard must keep DFlash available before lazy grammar triggers");
+    ok &= expect(sampling_cpp.find("if (common_sampler_blocks_speculative(gsmpl))") != std::string::npos, "speculative accept must stop when a token activates grammar/reasoning boundaries");
     ok &= expect(sampling_cpp.find("llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p)") != std::string::npos, "reduced verifier must still run the sampler chain");
     ok &= expect(sampling_cpp.find("gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false }") != std::string::npos, "reduced verifier sampler must tolerate unsorted GPU top-K candidates");
     ok &= expect(sampling_cpp.find("common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING") != std::string::npos, "reduced verifier must allow passthrough reasoning-budget tracking");
     ok &= expect(sampling_cpp.find("llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p)") != std::string::npos, "reduced verifier must preserve reasoning-budget sampler state");
     ok &= expect(server_context.find("dflash_select_reduced_verify_plan") != std::string::npos, "server must explicitly choose reduced verifier eligibility");
+    ok &= expect(server_context.find("common_sampler_blocks_speculative(slot.smpl.get())") != std::string::npos, "DFlash server path must skip drafting when grammar/reasoning guard requires full sampling");
+    ok &= expect(server_context.find("common_sampler_blocks_speculative(smpl)") != std::string::npos, "DFlash rejection sampling must stop at grammar/reasoning boundaries");
+    ok &= expect(server_context.find("speculative_flat_result_has_bonus") != std::string::npos, "server must distinguish grammar-boundary stops from bonus-token accepts");
+    ok &= expect(server_context.find("n_hidden_keep = ids.empty() ? 0 : n_accepted_draft + 1") != std::string::npos, "DFlash ring/tape keep count must include root plus accepted draft tokens");
+    ok &= expect(server_context.find("common_speculative_accept(slot.spec.get(), n_accepted_draft)") != std::string::npos, "speculative stats must count accepted draft tokens, not bonus-token-shaped results");
+    ok &= expect(server_context.find("llama_dflash_rollback(ctx, slot.id, seq_backup, slot.n_pos_before_draft, n_hidden_keep)") != std::string::npos, "DFlash rollback must use the hidden-state keep count at grammar boundaries");
+    ok &= expect(server_context.find("dflash_suppressed_for_reasoning_tool_marker") != std::string::npos, "server must disable DFlash after raw tool markers inside hidden reasoning without steering generation");
+    ok &= expect(server_task.find("state.update_chat_msg(content, true, oaicompat_msg_diffs, true)") != std::string::npos, "streaming responses must filter partial tool-call deltas");
+    ok &= expect(server_task.find("task_result_has_complete_partial_tool_calls") != std::string::npos, "streaming responses must allow complete tool-call deltas before final EOS");
+    ok &= expect(server_task.find("task_result_filter_incomplete_partial_tool_calls") != std::string::npos, "streaming responses must expose stable tool-call headers without partial arguments");
+    ok &= expect(server_task.find("A partial stream may expose the stable tool name/id for UX") != std::string::npos, "partial tool-call streaming must document the header-only reliability boundary");
+    ok &= expect(server_task.find("task_result_quarantine_raw_tool_text") != std::string::npos, "streaming responses must quarantine malformed raw tool markers in tool-parsing mode");
+    ok &= expect(server_task.find("task_result_pos_is_in_code_fence") != std::string::npos, "raw marker quarantine must avoid code fence content");
+    ok &= expect(server_task.find("task_result_starts_with_raw_tool_marker") != std::string::npos, "streaming responses must suppress parser fallback text for wrapperless raw tool calls");
+    ok &= expect(server_task.find("task_result_freeze_text_fields") != std::string::npos, "incomplete parsed tool calls must not leak fallback text/reasoning deltas");
+    ok &= expect(server_context.find("raw tool marker observed while lazy grammar is enabled") != std::string::npos, "DFlash must suppress after raw tool markers even outside parsed reasoning");
+    ok &= expect(server_context.find("server_tail_pos_is_in_code_fence") != std::string::npos, "DFlash raw-marker suppression must avoid fenced code content");
+    ok &= expect(server_context.find("server_tail_tool_marker_has_boundary") != std::string::npos, "DFlash raw-marker suppression must avoid embedded string false positives");
+    ok &= expect(chat_auto_parser_generator.find("allow_direct_func_start") != std::string::npos, "tag-style parsers must accept valid direct function starts without outer wrappers");
+    ok &= expect(chat_auto_parser_generator.find("autoparser.tools.function.name_prefix") != std::string::npos, "lazy grammar triggers must include structural function markers");
     ok &= expect(server_context.find("sampling.has_logit_bias() || sampling.ignore_eos") != std::string::npos, "server must not treat inactive precomputed EOG biases as active logit bias");
     ok &= expect(server_context.find("finite-reasoning-budget") != std::string::npos, "server must disable reduced verifier only for finite reasoning budgets");
     ok &= expect(server_context.find("llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled") != std::string::npos, "server must enable reduced verifier graph once per eligible batch");
@@ -224,7 +249,7 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("rows_available") != std::string::npos, "server DFlash verifier padding must respect batch and ubatch capacity");
     ok &= expect(server_context.find("for (int idx : slot.spec_pad_i_batch)") != std::string::npos, "reduced verifier coverage must account for explicit padding rows");
     ok &= expect(server_context.find("const bool had_dflash_padding = !slot.spec_pad_i_batch.empty()") != std::string::npos, "server must remember verifier padding through accept bookkeeping");
-    ok &= expect(server_context.find("const bool all_accepted_flat = (ids.size() == n_draft + 1) && !had_dflash_padding") != std::string::npos, "DFlash verifier padding must force rollback even when all real draft tokens were accepted");
+    ok &= expect(server_context.find("const bool all_accepted_flat = (n_accepted_draft == (int) n_draft) && !had_dflash_padding") != std::string::npos, "DFlash verifier padding must force rollback even when all real draft tokens were accepted");
 
     return ok ? 0 : 1;
 }

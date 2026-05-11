@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -4434,6 +4435,141 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_task_result_state_tool_call_stream_filter() {
+    auto tmpls = read_templates("models/templates/Kimi-K2-Thinking.jinja");
+
+    common_chat_templates_inputs inputs;
+    inputs.messages = { message_user };
+    inputs.tools = { special_function_tool };
+    inputs.parallel_tool_calls = true;
+
+    make_peg_parser parser(tmpls.get(), inputs);
+
+    common_chat_parser_params parser_params(parser.params_);
+    parser_params.parser = parser.arena_;
+    parser_params.parse_tool_calls = true;
+
+    task_result_state state(parser_params);
+
+    {
+        std::vector<common_chat_msg_diff> diffs;
+        state.update_chat_msg(
+            "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0",
+            true,
+            diffs,
+            true);
+        assert_equals(size_t(0), diffs.size());
+    }
+
+    {
+        std::vector<common_chat_msg_diff> diffs;
+        state.update_chat_msg("<|tool_call_argument_begin|>", true, diffs, true);
+        assert_equals(size_t(1), diffs.size());
+        assert_equals(size_t(0), diffs[0].tool_call_index);
+        assert_equals(std::string("special_function"), diffs[0].tool_call_delta.name);
+        assert_equals(std::string("functions.special_function:0"), diffs[0].tool_call_delta.id);
+        assert_equals(std::string(""), diffs[0].tool_call_delta.arguments);
+    }
+
+    {
+        std::vector<common_chat_msg_diff> diffs;
+        state.update_chat_msg("{\"arg1\": ", true, diffs, true);
+        assert_equals(size_t(0), diffs.size());
+    }
+
+    {
+        std::vector<common_chat_msg_diff> diffs;
+        state.update_chat_msg("1}<|tool_call_end|><|tool_calls_section_end|>", true, diffs, true);
+        assert_equals(size_t(1), diffs.size());
+        assert_equals(size_t(0), diffs[0].tool_call_index);
+        assert_equals(std::string(""), diffs[0].tool_call_delta.name);
+        assert_equals(std::string(""), diffs[0].tool_call_delta.id);
+        assert_equals(std::string("{\"arg1\": 1}"), diffs[0].tool_call_delta.arguments);
+    }
+
+    {
+        task_result_state raw_state(parser_params);
+        std::vector<common_chat_msg_diff> diffs;
+        raw_state.update_chat_msg("Visible before marker\n", true, diffs, true);
+        assert_equals(size_t(1), diffs.size());
+        assert_equals(std::string("Visible before marker\n"), diffs[0].content_delta);
+
+        diffs.clear();
+        raw_state.update_chat_msg("<function=read the llama_perf_context_data struct>", true, diffs, true);
+        assert_equals(size_t(0), diffs.size());
+
+        diffs.clear();
+        raw_state.update_chat_msg(" trailing text", false, diffs, true);
+        assert_equals(size_t(0), diffs.size());
+    }
+
+    {
+        task_result_state code_state(parser_params);
+        std::vector<common_chat_msg_diff> diffs;
+        const std::string code = "```xml\n<function=example>\n```\n";
+        code_state.update_chat_msg(code, true, diffs, true);
+        assert_equals(size_t(1), diffs.size());
+        assert_equals(code, diffs[0].content_delta);
+    }
+
+    {
+        auto qwen_tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+
+        common_chat_templates_inputs qwen_inputs;
+        qwen_inputs.messages = { message_user };
+        qwen_inputs.tools = { special_function_tool };
+        qwen_inputs.parallel_tool_calls = true;
+
+        make_peg_parser qwen_parser(qwen_tmpls.get(), qwen_inputs);
+        common_chat_parser_params qwen_params(qwen_parser.params_);
+        qwen_params.parser = qwen_parser.arena_;
+        qwen_params.parse_tool_calls = true;
+
+        bool has_direct_function_trigger = false;
+        for (const auto & trigger : qwen_parser.params_.grammar_triggers) {
+            has_direct_function_trigger = has_direct_function_trigger || trigger.value == "<function=";
+        }
+        assert_equals(true, has_direct_function_trigger);
+
+        const std::string direct_call =
+            "<function=special_function>\n"
+            "<parameter=arg1>\n"
+            "1\n"
+            "</parameter>\n"
+            "</function>\n";
+        const auto direct_msg = common_chat_peg_parse(qwen_parser.arena_, direct_call, false, qwen_params);
+        assert_equals(size_t(1), direct_msg.tool_calls.size());
+        assert_equals(std::string("special_function"), direct_msg.tool_calls[0].name);
+        assert_equals(std::string("{\"arg1\":1}"), direct_msg.tool_calls[0].arguments);
+
+        task_result_state qwen_state(qwen_params);
+
+        std::vector<common_chat_msg_diff> diffs;
+        qwen_state.update_chat_msg("<function=special_function>\n", true, diffs, true);
+        assert_equals(std::vector<common_chat_msg_diff>{}, diffs);
+
+        diffs.clear();
+        qwen_state.update_chat_msg("<parameter=arg1>\n", true, diffs, true);
+        assert_equals(size_t(1), diffs.size());
+        assert_equals(size_t(0), diffs[0].tool_call_index);
+        assert_equals(std::string("special_function"), diffs[0].tool_call_delta.name);
+        assert_equals(false, diffs[0].tool_call_delta.id.empty());
+        assert_equals(std::string(""), diffs[0].tool_call_delta.arguments);
+
+        diffs.clear();
+        qwen_state.update_chat_msg("1\n", true, diffs, true);
+        assert_equals(size_t(0), diffs.size());
+
+        diffs.clear();
+        qwen_state.update_chat_msg("</parameter>\n</function>\n", true, diffs, true);
+        assert_equals(size_t(1), diffs.size());
+        assert_equals(size_t(0), diffs[0].tool_call_index);
+        assert_equals(std::string(""), diffs[0].tool_call_delta.name);
+        assert_equals(std::string(""), diffs[0].tool_call_delta.id);
+        assert_equals(std::string("{\"arg1\":1}"), diffs[0].tool_call_delta.arguments);
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -4512,6 +4648,7 @@ int main(int argc, char ** argv) {
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_reka_edge_common_path();
+        test_task_result_state_tool_call_stream_filter();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }
