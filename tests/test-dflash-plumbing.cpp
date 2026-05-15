@@ -56,6 +56,7 @@ int main(int argc, char ** argv) {
     const std::string qwen35 = read_file(root + "/src/models/qwen35.cpp");
     const std::string qwen35moe = read_file(root + "/src/models/qwen35moe.cpp");
     const std::string gemma4_iswa = read_file(root + "/src/models/gemma4-iswa.cpp");
+    const std::string convert_py = read_file(root + "/convert_hf_to_gguf.py");
     const std::string graph_h = read_file(root + "/src/llama-graph.h");
     const std::string model_cpp = read_file(root + "/src/llama-model.cpp");
     const std::string cuda_ring = read_file(root + "/ggml/src/ggml-cuda/cross-ring-interleave.cu");
@@ -266,6 +267,23 @@ int main(int argc, char ** argv) {
     ok &= expect(gemma4_iswa.find("cparams.dflash_verify_logits") != std::string::npos, "Gemma4-ISWA target graph must emit reduced verifier logits only when gated");
     ok &= expect(gemma4_iswa.find("ggml_topk_ext(ctx0, cur, topk, 0.0f, 0)") != std::string::npos, "Gemma4-ISWA target verifier top-K must emit raw logit candidates");
     ok &= expect(gemma4_iswa.find("#include <algorithm>") != std::string::npos, "Gemma4-ISWA must include <algorithm> for std::max/std::min in verifier path");
+    ok &= expect(speculative.find("n_target_features != n_embd * n_target_layers") != std::string::npos,
+        "DFlash must validate n_target_features against n_embd * n_target_layers");
+    ok &= expect(speculative.find("target_layer_ids contain duplicates") != std::string::npos,
+        "DFlash must reject duplicate target_layer_ids");
+    ok &= expect(speculative.find("target_layer_id") != std::string::npos &&
+                 speculative.find("outside target layer range") != std::string::npos,
+        "DFlash must validate target_layer_ids against target model layer range");
+    ok &= expect(speculative.find("dflash: contract ok:") != std::string::npos,
+        "DFlash must log validated drafter/target contract");
+    ok &= expect(dflash_draft.find("n_feat != target_hidden->ne[0]") != std::string::npos,
+        "DFlash drafter input must reject cross feature-size mismatches");
+    ok &= expect(dflash_draft.find("ggml_backend_tensor_memset(target_hidden, 0, 0, tensor_bytes)") != std::string::npos,
+        "DFlash drafter input must zero target_hidden on invalid or missing cross data");
+    ok &= expect(convert_py.find("DFlashDraftModel: missing") != std::string::npos,
+        "DFlash converter must warn when using default metadata");
+    ok &= expect(convert_py.find("DFlashDraftModel metadata:") != std::string::npos,
+        "DFlash converter must print DFlash metadata summary");
     ok &= expect(qwen35.find("ggml_topk_ext(ctx0, cur, topk, 0.0f, 0)") != std::string::npos, "Qwen3.5 target verifier top-K must emit raw logit candidates");
     ok &= expect(qwen35moe.find("ggml_topk_ext(ctx0, cur, topk, 0.0f, 0)") != std::string::npos, "Qwen3.5-MoE target verifier top-K must emit raw logit candidates");
     ok &= expect(cuda_argmax.find("temp > 0.0f && seed != 0") != std::string::npos, "CUDA argmax/top-K must skip logsumexp for deterministic verifier top-K");
