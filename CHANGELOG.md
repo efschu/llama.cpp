@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.0
+
+- Added compatibility with upstream DFlash PR drafter GGUFs that use `general.architecture = dflash`. Bee now keeps this as a separate schema from `dflash-draft`, reads upstream metadata keys such as `dflash.block_size` and `dflash.target_layer_ids`, uses upstream tensor names such as `fc.weight`, `hidden_norm.weight`, and `blk.N.ffn_norm.weight`, and keeps existing Bee/buun `dflash-draft` tensor and metadata names unchanged.
+- Hardened recurrent memory resizing and prompt-cache restore paths. Recurrent resize now repairs tails, sequence IDs, source links, `used`, `head`, `n`, and recurrent-state size metadata after shrink/expand, while the server shrinks recurrent state before prompt-cache save/load when it is safe to do so.
+- Fixed DFlash backup-sequence cleanup and recurrent copy behavior. Server slots now track the backup sequence ID they created, clear leaked backup cells on release, and preserve the local DFlash recurrent copy-plan invalidation path after recurrent memory changes.
+- Added unified-KV admission deferral for non-parent server tasks so large pending prompts do not over-commit shared KV cells while active slots still own prompt or task tokens.
+- Added categorized DFlash profiling and diagnostics. `GGML_DFLASH_PROFILE` can enable summary, replay, copy, prefill, verify, and trace logging, and DFlash logs now report draft/verify/accept timing, graph reuse, reduced-verifier decisions, stream-copy behavior, and contract details.
+- Improved DFlash CUDA stream ordering. GPU hidden capture, recurrent replay, K/V projection-cache updates, backup copies, graph-copied hidden tensors, and DFlash stream waits now use explicit backend/DFlash stream ordering helpers instead of broad synchronization where possible.
+- Added DFlash drafter K/V projection caching for the cross-attention window, including ring-only persistent K/V storage, chronological D2D append/interleave helpers, K-only/V-only diagnostic isolation, a kill switch, CUDA graph-capture exclusions, and multi-GPU draft-placement fallback.
+- Reduced DFlash verification overhead in greedy paths. The verifier can consume reduced top-k logits for eligible DFlash verify batches, skips raw-logit readback when the reduced path is active, preserves seed-token row alignment, and falls back when grammar, sampling, or reasoning state requires full logits.
+- Fixed reasoning-end forcing with reduced DFlash verification. When an EOG token appears during active reasoning, the sampler now forces the reasoning-end token through the normal forcing path instead of accepting an unsafe reduced candidate set.
+- Reworked DFlash prefill capture and flush handling. Prefill capture now tracks per-slot plans, GPU staging buffers, source-aware CPU/GPU ring validity, suffix spans across internal ubatches, graph-reuse keys for source/destination offsets, and fail-closed behavior for partial or mismatched captures.
+- Hardened target hidden-state capture across Qwen3.5, Qwen3.5-MoE, Gemma4-ISWA, GPU tape, hidden-only, and prefill-only contexts. Capture layer assignment, callback suppression, token-count derivation, per-view plans, multi-slot GPU cross data, and shape validation now have explicit checks and regression coverage.
+- Added DFlash input and contract validation. The drafter now rejects cross feature-size mismatches, validates mask tokens and target layer metadata, logs target/drafter vocab and context contracts, and provides debug toggles such as `GGML_DFLASH_DEBUG`, `GGML_DFLASH_INPUT_DEBUG`, `GGML_DFLASH_CUDA_DEBUG`, `GGML_DFLASH_FORCE_CPU_CROSS`, and `GGML_DFLASH_VERBOSE_CONTRACT`.
+- Extended CUDA FlashAttention template coverage for 512-wide quantized K/V combinations, including TurboQuant and TCQ cache types, and added generator/test coverage so the 512-dim instances are not dropped.
+- Fixed long-context DFlash and CUDA stability issues, including GPU ring crashes in DFlash K/V updates at long-context prefill, TurboQuant GPU-ring hangs, CUDA driver link propagation, op-table drift, Gated DeltaNet kernel hardening, and stream-safe DFlash replay.
+- Reduced peak memory in the perplexity tool and fixed streaming perplexity/KLD logits memory. Streaming perplexity now writes bounded chunks, checks stream errors, and avoids retaining unbounded logits for long-context KL runs.
+- Improved DFlash draft model discovery and download plumbing so sibling DFlash draft GGUFs can be found more reliably from related model repositories.
+- Improved DFlash converter support and diagnostics. DFlash conversion now handles `dflash_config` metadata nesting, logs metadata warnings and summaries, scopes Gemma4 tokenizer handling, and validates DFlash-specific metadata more clearly.
+- Expanded regression coverage for DFlash server invariants, recurrent prompt-cache shrink/expand, reduced verifier behavior, CUDA stream ordering, prefill staging, ring validity, contract validation, converter metadata, adaptive draft-max behavior, sampling/reasoning-end forcing, and streaming perplexity plumbing.
+
 ## v0.1.2
 
 - Fixed the adaptive `profit` controller's no-spec baseline path. Profit mode now seeds baseline samples before positive-depth warmup, can shut DFlash fully off when the measured baseline wins, and no longer makes speculative decisions from draft-only telemetry.

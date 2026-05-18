@@ -315,7 +315,7 @@ Adaptive draft is highly configurable, so if you are interested in tinkering wit
 
 **Out of VRAM.** Reduce `--ctx-size` first, then cache types, then target quantization. See [Adjusting for your hardware](#adjusting-for-your-hardware).
 
-**`spec-type dflash is set but draft model is not a dflash-draft model`.** The file passed to `--spec-draft-model` is not a DFlash draft GGUF. Make sure you are linking the DFlash draft model, not a regular Qwen model.
+**`spec-type dflash is set but draft model is not a DFlash drafter`.** Bee accepts two DFlash drafter GGUF schemas: `dflash-draft` for the Bee/buun schema, and `dflash` for the upstream llama.cpp DFlash PR schema. If loading fails, check the exact error for missing DFlash metadata keys or tensors. A plain Qwen model is still not a DFlash drafter.
 
 **`model.n_devices() > 1: disabling parent_ids_gpu`.** Tree verification is disabled because the target model spans multiple GPUs. Flat DFlash still works. This is expected.
 
