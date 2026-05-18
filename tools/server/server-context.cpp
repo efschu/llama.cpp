@@ -653,6 +653,7 @@ struct server_slot : server_adaptive_dm_state {
     // Hybrid model: recurrent state backup for speculative decoding
     bool has_draft_backup = false;
     bool has_recurrent_only_backup = false;
+    llama_seq_id seq_id_backup = -1;
     int  n_tokens_before_draft = 0; // prompt token count before draft tokens were added
     llama_pos n_pos_before_draft = 0; // KV position before draft tokens (accounts for mmproj position expansion)
 
@@ -706,6 +707,7 @@ struct server_slot : server_adaptive_dm_state {
         n_draft_accepted = 0;
         has_draft_backup = false;
         has_recurrent_only_backup = false;
+        seq_id_backup = -1;
         n_tokens_before_draft = 0;
         n_pos_before_draft = 0;
 
@@ -1035,6 +1037,10 @@ struct server_slot : server_adaptive_dm_state {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+
+            if (has_draft_backup && seq_id_backup >= 0) {
+                llama_memory_seq_rm(llama_get_memory(ctx), seq_id_backup, -1, -1);
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -1583,6 +1589,53 @@ private:
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
         prompt_cache->update();
+    }
+
+    bool recurrent_shrink_for_prompt_cache(const char * reason) {
+        if (!recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
+            return false;
+        }
+
+        for (const server_slot & slot : slots) {
+            if (slot.is_processing() || slot.has_draft_backup) {
+                SRV_DBG("not shrinking recurrent state for prompt cache (%s): slot %d processing=%d has_backup=%d\n",
+                        reason, slot.id, slot.is_processing(), slot.has_draft_backup);
+                return false;
+            }
+        }
+
+        auto * mem = llama_get_memory(ctx);
+        for (const server_slot & slot : slots) {
+            const llama_seq_id seq_backup = slot.id + n_parallel_user;
+            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+        }
+
+        if (llama_context_recurrent_shrink(ctx, n_parallel_user)) {
+            recurrent_expanded = false;
+            SRV_INF("shrunk recurrent state to %d cells for prompt cache (%s, removed %d backup cells)\n",
+                    n_parallel_user, reason, n_seq_max_full - n_parallel_user);
+            return true;
+        } else {
+            SRV_ERR("failed to shrink recurrent state to %d cells for prompt cache (%s)\n",
+                    n_parallel_user, reason);
+            return false;
+        }
+    }
+
+    void recurrent_expand_after_prompt_cache(const char * reason) {
+        if (recurrent_expanded || !needs_reeval || n_seq_max_full <= n_parallel_user) {
+            return;
+        }
+
+        if (llama_context_recurrent_expand(ctx, n_seq_max_full)) {
+            recurrent_expanded = true;
+            SRV_INF("expanded recurrent state to %d cells after prompt cache (%s)\n",
+                    n_seq_max_full, reason);
+        } else {
+            SRV_ERR("failed to expand recurrent state to %d cells after prompt cache (%s)\n",
+                    n_seq_max_full, reason);
+            GGML_ABORT("failed to expand recurrent state after prompt cache restore; continuing would make scheduler reservation inconsistent\n");
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -2248,6 +2301,8 @@ private:
                 SRV_WRN("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
+                const bool shrunk_for_prompt_cache =
+                    recurrent_shrink_for_prompt_cache("before prompt cache save/load");
 
                 // don't save the slot's state if its context is empty
                 if (tokens.size() > 0) {
@@ -2259,6 +2314,10 @@ private:
                 }
 
                 prompt_cache->update();
+
+                if (shrunk_for_prompt_cache) {
+                    recurrent_expand_after_prompt_cache("after prompt cache save/load");
+                }
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -3129,9 +3188,28 @@ private:
                             SRV_ERR("failed to launch slot with parent task, id_task = %d\n", id_task);
                             break; // drop the task
                         }
-                    } else if (!launch_slot_with_task(*slot, std::move(task))) {
-                        SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
-                        break; // drop the task
+                    } else {
+                        if (params_base.kv_unified && task.n_tokens() > 0 && task.n_tokens() < slot->n_ctx) {
+                            int64_t cells_committed = 0;
+                            for (const auto & s : slots) {
+                                if (s.is_processing() && s.task) {
+                                    cells_committed += std::max((int64_t) s.prompt.n_tokens(), (int64_t) s.task->n_tokens());
+                                }
+                            }
+
+                            const int64_t cells_available = (int64_t) slot->n_ctx - cells_committed;
+                            if (cells_available < (int64_t) task.n_tokens()) {
+                                SRV_DBG("defer task %d: needs %d tokens but only %" PRId64 " cells available (%" PRId64 " committed by active slots)\n",
+                                        id_task, task.n_tokens(), cells_available, cells_committed);
+                                queue_tasks.defer(std::move(task));
+                                break;
+                            }
+                        }
+
+                        if (!launch_slot_with_task(*slot, std::move(task))) {
+                            SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
+                            break; // drop the task
+                        }
                     }
 
                     if (params_base.cache_idle_slots) {
@@ -3680,6 +3758,7 @@ private:
                             }
                             slot.has_draft_backup = true;
                             slot.has_recurrent_only_backup = (n_branches == 0);
+                            slot.seq_id_backup = seq_backup;
                         }
 
                         llama_set_tree_mask(ctx, tree.visibility.data(), tree.n_nodes + 1);
@@ -3775,6 +3854,7 @@ private:
                         dflash_backup_recurrent_state(slot.id, seq_backup);
                         slot.has_draft_backup = true;
                         slot.has_recurrent_only_backup = true;
+                        slot.seq_id_backup = seq_backup;
                     }
 
                     // add all drafted tokens to the batch
@@ -4099,6 +4179,11 @@ private:
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         const size_t checkpoint_size = it->data.size();
+                                        SLT_DBG(slot,
+                                                "restoring context checkpoint data=%.3f MiB ring=%.3f MiB recurrent_expanded=%d n_parallel_user=%d n_seq_max_full=%d\n",
+                                                (float) it->data.size() / 1024 / 1024,
+                                                (float) it->ring_data.size() / 1024 / 1024,
+                                                recurrent_expanded, n_parallel_user, n_seq_max_full);
                                         const size_t n = llama_state_seq_set_data_ext(ctx, it->data.data(), checkpoint_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                                         if (n != checkpoint_size) {
@@ -5264,7 +5349,8 @@ private:
                 profile_accept_lap(profile_accept_book_us);
 
                 if (slot.has_draft_backup) {
-                    const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                    const llama_seq_id seq_backup = slot.seq_id_backup;
+                    GGML_ASSERT(seq_backup >= 0);
                     const bool all_accepted_flat = (n_accepted_draft == (int) n_draft) && !had_dflash_padding;
 
                     if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH && is_draft_tree) {
@@ -5399,6 +5485,7 @@ private:
 
                     slot.has_draft_backup = false;
                     slot.has_recurrent_only_backup = false;
+                    slot.seq_id_backup = -1;
                 } else {
                     llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.tokens.pos_next(), -1);
                     if (is_draft_tree) {
