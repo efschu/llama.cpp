@@ -49,6 +49,14 @@ static bool dflash_server_profile_enabled(uint32_t flags) {
     return dflash_profile_enabled(flags);
 }
 
+static bool dflash_server_crash_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_DFLASH_CRASH_TRACE");
+        return env && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool dflash_verify_padding_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_DFLASH_VERIFY_PAD");
@@ -3704,11 +3712,27 @@ private:
             auto * mem = llama_get_memory(ctx);
             dflash_recurrent_profile_reset(mem);
             const int64_t t_backup_start = dflash_profile_start();
-            if (!llama_dflash_memory_seq_cp_recurrent_ordered(ctx, seq_id_src, seq_id_dst, -1, -1)) {
+            if (dflash_server_crash_trace_enabled()) {
+                SRV_INF("dflash crash breadcrumb: recurrent backup enter src=%d dst=%d\n",
+                        (int) seq_id_src, (int) seq_id_dst);
+            }
+            const bool ordered = llama_dflash_memory_seq_cp_recurrent_ordered(ctx, seq_id_src, seq_id_dst, -1, -1);
+            if (!ordered) {
+                if (dflash_server_crash_trace_enabled()) {
+                    SRV_INF("dflash crash breadcrumb: recurrent backup fallback copy src=%d dst=%d\n",
+                            (int) seq_id_src, (int) seq_id_dst);
+                }
                 llama_memory_seq_cp_recurrent(mem, seq_id_src, seq_id_dst, -1, -1);
+            } else if (dflash_server_crash_trace_enabled()) {
+                SRV_INF("dflash crash breadcrumb: recurrent backup ordered copy complete src=%d dst=%d\n",
+                        (int) seq_id_src, (int) seq_id_dst);
             }
             dflash_profile_add(t_recurrent_backup_total, t_backup_start);
             dflash_recurrent_profile_collect(mem);
+            if (dflash_server_crash_trace_enabled()) {
+                SRV_INF("dflash crash breadcrumb: recurrent backup exit src=%d dst=%d\n",
+                        (int) seq_id_src, (int) seq_id_dst);
+            }
         };
         int n_slots_drafted = 0;
         server_slot * profit_baseline_slot = nullptr;
@@ -3932,11 +3956,16 @@ private:
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
 
-                if (slot.task->params.speculative.n_min > (int) draft.size()) {
-                    SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
-                    // fallback to normal decoding
+                if (draft.empty() || slot.task->params.speculative.n_min > (int) draft.size()) {
+                    if (!draft.empty()) {
+                        SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
+                    }
+                    // Fallback to normal decoding when the drafter produces nothing or too little.
+                    // This keeps the sampled token on the plain one-token path, which clears the
+                    // speculative bookkeeping and advances the committed suffix state normally.
                     slot.i_batch = slot.spec_i_batch[0];
                     slot.spec_draft.clear();
+                    slot.draft_log_probs.clear();
                     slot.spec_i_batch.clear();
                     slot.spec_pad_i_batch.clear();
                 } else {
@@ -3946,9 +3975,17 @@ private:
                     if (needs_reeval) {
                         // DFlash: sync previous tape replay
                         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                            if (dflash_server_crash_trace_enabled()) {
+                                SLT_INF(slot, "dflash crash breadcrumb: before tape_replay_sync pos=%d draft=%d prompt=%d\n",
+                                        slot.n_pos_before_draft, (int) draft.size(), slot.prompt.n_tokens());
+                            }
                             const int64_t t_replay_sync_start = dflash_profile_start();
                             llama_tape_replay_sync(ctx);
                             dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
+                            if (dflash_server_crash_trace_enabled()) {
+                                SLT_INF(slot, "dflash crash breadcrumb: after tape_replay_sync pos=%d draft=%d prompt=%d\n",
+                                        slot.n_pos_before_draft, (int) draft.size(), slot.prompt.n_tokens());
+                            }
                             // Only set tree parent IDs when tree budget > 0.
                             // Flat mode uses standard (non-tree) kernels to avoid
                             // tree-aware kernel divergence on hidden states.
@@ -3964,6 +4001,10 @@ private:
                         }
 
                         if (!recurrent_expanded) {
+                            if (dflash_server_crash_trace_enabled()) {
+                                SLT_INF(slot, "dflash crash breadcrumb: before recurrent_expand target_cells=%d\n",
+                                        n_seq_max_full);
+                            }
                             if (llama_context_recurrent_expand(ctx, n_seq_max_full)) {
                                 SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
                             } else {
@@ -3971,14 +4012,36 @@ private:
                                 GGML_ABORT("failed to expand recurrent state for speculative backup; continuing would corrupt recurrent replay\n");
                             }
                             recurrent_expanded = true;
+                            if (dflash_server_crash_trace_enabled()) {
+                                SLT_INF(slot, "dflash crash breadcrumb: after recurrent_expand target_cells=%d\n",
+                                        n_seq_max_full);
+                            }
                         }
                         const llama_seq_id seq_backup = slot.id + n_parallel_user;
                         auto * mem = llama_get_memory(ctx);
+                        if (dflash_server_crash_trace_enabled()) {
+                            SLT_INF(slot, "dflash crash breadcrumb: before backup seq_rm seq=%d backup=%d pos=%d draft=%d\n",
+                                    slot.id, (int) seq_backup, slot.n_pos_before_draft, (int) draft.size());
+                        }
                         llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        if (dflash_server_crash_trace_enabled()) {
+                            SLT_INF(slot, "dflash crash breadcrumb: after backup seq_rm seq=%d backup=%d\n",
+                                    slot.id, (int) seq_backup);
+                            SLT_INF(slot, "dflash crash breadcrumb: before recurrent backup seq=%d backup=%d\n",
+                                    slot.id, (int) seq_backup);
+                        }
                         dflash_backup_recurrent_state(slot.id, seq_backup);
+                        if (dflash_server_crash_trace_enabled()) {
+                            SLT_INF(slot, "dflash crash breadcrumb: after recurrent backup seq=%d backup=%d\n",
+                                    slot.id, (int) seq_backup);
+                        }
                         slot.has_draft_backup = true;
                         slot.has_recurrent_only_backup = true;
                         slot.seq_id_backup = seq_backup;
+                        if (dflash_server_crash_trace_enabled()) {
+                            SLT_INF(slot, "dflash crash breadcrumb: backup armed seq=%d backup=%d\n",
+                                    slot.id, (int) seq_backup);
+                        }
                     }
 
                     // add all drafted tokens to the batch
@@ -3986,6 +4049,10 @@ private:
                         slot.spec_i_batch.push_back(batch.n_tokens);
                         common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
                         slot.prompt.tokens.push_back(draft[i]);
+                    }
+                    if (dflash_server_crash_trace_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                        SLT_INF(slot, "dflash crash breadcrumb: draft rows appended batch_tokens=%d spec_rows=%d draft=%d\n",
+                                batch.n_tokens, (int) slot.spec_i_batch.size(), (int) draft.size());
                     }
                     const int active_verify_draft_max = n_draft_max;
                     const common_params_sampling & slot_sampling =
@@ -4704,7 +4771,21 @@ private:
                 }
             }
         }
+        if (dflash_server_crash_trace_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            SRV_INF("dflash crash breadcrumb: before verify logits config graph=%d enabled=%d top_k=%d batch_tokens=%d\n",
+                    dflash_verify_graph_enabled ? 1 : 0,
+                    dflash_verify_plan.enabled ? 1 : 0,
+                    dflash_verify_plan.top_k,
+                    batch.n_tokens);
+        }
         llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
+        if (dflash_server_crash_trace_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            SRV_INF("dflash crash breadcrumb: after verify logits config graph=%d enabled=%d top_k=%d batch_tokens=%d\n",
+                    dflash_verify_graph_enabled ? 1 : 0,
+                    dflash_verify_plan.enabled ? 1 : 0,
+                    dflash_verify_plan.top_k,
+                    batch.n_tokens);
+        }
         if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
             dflash_log_reduced_verify_decision(
                     dflash_verify_graph_enabled,
@@ -4942,7 +5023,20 @@ private:
             }
 
             const int64_t t_verify_start = ggml_time_us();
+            if (dflash_server_crash_trace_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                SRV_INF("dflash crash breadcrumb: before verify decode view_start=%d n_tokens=%d reduced=%d top_k=%d\n",
+                        i,
+                        n_tokens,
+                        dflash_reduce_this_view ? 1 : 0,
+                        dflash_verify_plan.top_k);
+            }
             const int ret = llama_decode(ctx, batch_view);
+            if (dflash_server_crash_trace_enabled() && params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                SRV_INF("dflash crash breadcrumb: after verify decode view_start=%d n_tokens=%d ret=%d\n",
+                        i,
+                        n_tokens,
+                        ret);
+            }
             if (ret == 0 && dflash_reduce_this_view) {
                 int32_t * compact_argmax = llama_get_logits_argmax(ctx);
                 const int32_t compact_n = llama_get_logits_argmax_n(ctx);

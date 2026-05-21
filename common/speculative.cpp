@@ -119,6 +119,24 @@ static bool common_dflash_gpu_ring_allowed(llama_context * ctx_tgt, llama_contex
     return true;
 }
 
+static bool common_dflash_argmax_token_valid(int32_t token_id, int n_vocab) {
+    return token_id >= 0 && token_id < n_vocab;
+}
+
+static bool common_dflash_argmax_shape_valid(
+        const char * where,
+        int rows_available,
+        int rows_required,
+        int top_k) {
+    if (top_k < 1 || rows_available < rows_required) {
+        LOG_ERR("dflash: invalid reduced-logits shape in %s (rows=%d required=%d top_k=%d)\n",
+                where, rows_available, rows_required, top_k);
+        return false;
+    }
+
+    return true;
+}
+
 common_dflash_ring_write common_dflash_ring_write_plan(int ring_size, int ring_pos, int n_tokens) {
     if (ring_size <= 0 || n_tokens <= 0) {
         return { 0, 0, 0 };
@@ -2565,7 +2583,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
             int32_t * argmax = llama_get_logits_argmax(ctx_dft);
             float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
             const int K_flat = llama_get_logits_argmax_k(ctx_dft);
+            const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
             if (argmax) {
+                const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+                if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, batch_len, K_flat)) {
+                    if (draft_log_probs) {
+                        draft_log_probs->clear();
+                    }
+                    result.clear();
+                    return;
+                }
+
                 // GPU argmax path - only 64-128 bytes transferred instead of 15.9MB
                 for (int i = 1; i < batch_len && (int) result.size() < n_draft; ++i) {
                     if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
@@ -2577,7 +2605,18 @@ struct common_speculative_state_dflash : public common_speculative_state {
                             break;
                         }
                     }
-                    result.push_back((llama_token) argmax[i * K_flat]);
+                    const int32_t token_raw = argmax[i * K_flat];
+                    if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
+                        LOG_ERR("dflash: invalid reduced-logits token %d in %s at row=%d/%d (top_k=%d committed=%d cross_len=%d)\n",
+                                token_raw, __func__, i, batch_len, K_flat, committed_len, cross_len);
+                        if (draft_log_probs) {
+                            draft_log_probs->clear();
+                        }
+                        result.clear();
+                        return;
+                    }
+
+                    result.push_back((llama_token) token_raw);
                     if (draft_log_probs && argmax_probs) {
                         draft_log_probs->push_back(argmax_probs[i * K_flat]);
                     }
@@ -2692,6 +2731,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
         float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
+        const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+        if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, depth_limit + 1, K)) {
+            return;
+        }
 
         // Build tree using best-first heap expansion with chain-seed backbone
         tree.tokens.clear();
@@ -2711,7 +2755,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
         {
             int parent = 0;
             for (int d = 1; d <= depth_limit && d <= main_path_len && tree.n_nodes < tree_budget; ++d) {
-                llama_token token_id = (llama_token) argmax[d * K];
+                const int32_t token_raw = argmax[d * K];
+                if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
+                    LOG_ERR("dflash tree: invalid reduced-logits token %d in %s at depth=%d/%d (top_k=%d)\n",
+                            token_raw, __func__, d, depth_limit, K);
+                    break;
+                }
+
+                llama_token token_id = (llama_token) token_raw;
                 float log_prob = argmax_probs ? argmax_probs[d * K + 0] : -INFINITY;
 
                 int current_idx = tree.n_nodes + 1;
@@ -2757,8 +2808,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
                 auto top = heap.top();
                 heap.pop();
 
-                llama_token token_id = (llama_token) argmax[top.depth * K + top.rank];
-                if (token_id < 0) continue;
+                const int32_t token_raw = argmax[top.depth * K + top.rank];
+                if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) continue;
+                llama_token token_id = (llama_token) token_raw;
                 if (tree.child_maps[top.parent_idx].count(token_id)) continue;
 
                 int current_idx = tree.n_nodes + 1;
@@ -2790,8 +2842,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
             for (int d = 1; d <= main_path_len && (tree.n_nodes - tree.main_path_len) < branch_budget; ++d) {
                 int parent_idx = (d == 1) ? 0 : d - 1;
                 for (int ki = 1; ki < K && (tree.n_nodes - tree.main_path_len) < branch_budget; ++ki) {
-                    llama_token alt_token = (llama_token) argmax[d * K + ki];
-                    if (alt_token < 0) continue;
+                    const int32_t token_raw = argmax[d * K + ki];
+                    if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) continue;
+                    llama_token alt_token = (llama_token) token_raw;
                     if (tree.child_maps[parent_idx].count(alt_token)) continue;
 
                     int current_idx = tree.n_nodes + 1;
@@ -3751,6 +3804,7 @@ void common_speculative_draft_batch(
     int32_t * argmax  = llama_get_logits_argmax(ctx_dft);
     float   * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
     const int K_flat  = llama_get_logits_argmax_k(ctx_dft);
+    const int argmax_rows = llama_get_logits_argmax_n(ctx_dft);
 
     for (int r = 0; r < n_ready; r++) {
         auto & rs     = ready[r];
@@ -3759,6 +3813,15 @@ void common_speculative_draft_batch(
         const int offset = r * batch_len;
 
         if (argmax) {
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
+            if (!common_dflash_argmax_shape_valid(__func__, argmax_rows, n_ready * batch_len, K_flat)) {
+                if (log_probs) {
+                    log_probs->clear();
+                }
+                result.clear();
+                return;
+            }
+
             for (int i = 1; i < batch_len && (int) result.size() < n_draft; i++) {
                 if (argmax_probs && params.p_min > 0.0f && (int) result.size() >= params.n_min) {
                     float log_prob = argmax_probs[(offset + i) * K_flat];
@@ -3766,7 +3829,18 @@ void common_speculative_draft_batch(
                         break;
                     }
                 }
-                result.push_back((llama_token) argmax[(offset + i) * K_flat]);
+                const int32_t token_raw = argmax[(offset + i) * K_flat];
+                if (!common_dflash_argmax_token_valid(token_raw, n_vocab)) {
+                    LOG_ERR("dflash batch: invalid reduced-logits token %d in %s at spec=%d row=%d/%d (top_k=%d offset=%d)\n",
+                            token_raw, __func__, rs.spec_idx, i, batch_len, K_flat, offset);
+                    if (log_probs) {
+                        log_probs->clear();
+                    }
+                    result.clear();
+                    break;
+                }
+
+                result.push_back((llama_token) token_raw);
                 if (log_probs && argmax_probs) {
                     log_probs->push_back(argmax_probs[(offset + i) * K_flat]);
                 }
