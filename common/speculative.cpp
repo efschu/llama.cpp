@@ -3185,7 +3185,7 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
     }
 
     bool need_embd() const override {
-        return true;
+        return false;
     }
 
 private:

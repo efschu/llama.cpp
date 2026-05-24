@@ -617,6 +617,17 @@ int main(int argc, char ** argv) {
                      helper.find("need_embd()") == std::string::npos,
             "DFlash prompt/prefill raw-logit diagnostic must be based on sampling prompt state, not need_embd()");
     }
+    {
+        const size_t dflash_pos = speculative.find("struct common_speculative_impl_dflash");
+        const size_t dflash_end = dflash_pos == std::string::npos ? std::string::npos :
+            speculative.find("private:", dflash_pos);
+        const std::string dflash_impl = dflash_pos == std::string::npos || dflash_end == std::string::npos
+            ? std::string()
+            : speculative.substr(dflash_pos, dflash_end - dflash_pos);
+        ok &= expect(!dflash_impl.empty() &&
+                     dflash_impl.find("bool need_embd() const override {\n        return false;\n    }") != std::string::npos,
+            "DFlash must not request post-norm embeddings because that forces prompt prefill to output full raw logits");
+    }
     ok &= expect(speculative.find("n_target_features != n_embd * n_target_layers") != std::string::npos,
         "DFlash must validate n_target_features against n_embd * n_target_layers");
     ok &= expect(speculative.find("target_layer_ids contain duplicates") != std::string::npos,
