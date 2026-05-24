@@ -4786,11 +4786,71 @@ private:
 
         int32_t i_next = 0;
 
-        // allow multi-seq batching when the batch is pure TG (no prompt tokens).
-        // This lets concurrent slots' verify tokens be processed in a single
-        // multi-seq ubatch instead of N sequential per-seq ubatches.
-        const bool can_batch_multiseq = (n_tg_tokens == batch.n_tokens && n_tg_tokens > 0
-            && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH);
+        // Allow multi-seq batching only when the batch is pure TG (no prompt
+        // tokens) and every participating sequence owns DFlash state. With
+        // --spec-dflash-max-slots below -np, higher slots are intentionally
+        // non-speculative; batching them with DFlash slots leaves the target
+        // capture path with partial per-seq buffers.
+        const bool dflash_pure_tg_batch =
+            n_tg_tokens == batch.n_tokens &&
+            n_tg_tokens > 0 &&
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH;
+        const char * dflash_multiseq_block_reason = "not-pure-tg";
+        llama_seq_id dflash_multiseq_block_seq = -1;
+        int dflash_multiseq_n_unique = 0;
+        const bool dflash_tg_batch_all_spec_slots = [&]() {
+            if (!dflash_pure_tg_batch) {
+                return false;
+            }
+
+            llama_seq_id unique_seqs[LLAMA_DFLASH_MAX_SLOTS] = {};
+            for (int32_t t = 0; t < n_tg_tokens; ++t) {
+                for (int32_t k = 0; k < batch.n_seq_id[t]; ++k) {
+                    const llama_seq_id seq = batch.seq_id[t][k];
+                    bool seen = false;
+                    for (int s = 0; s < dflash_multiseq_n_unique; ++s) {
+                        if (unique_seqs[s] == seq) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (seen) {
+                        continue;
+                    }
+                    if (dflash_multiseq_n_unique >= (int) LLAMA_DFLASH_MAX_SLOTS) {
+                        dflash_multiseq_block_reason = "too-many-seqs";
+                        dflash_multiseq_block_seq = seq;
+                        return false;
+                    }
+                    unique_seqs[dflash_multiseq_n_unique++] = seq;
+                }
+            }
+
+            for (int s = 0; s < dflash_multiseq_n_unique; ++s) {
+                const llama_seq_id seq = unique_seqs[s];
+                auto it = std::find_if(slots.begin(), slots.end(), [seq](const server_slot & slot) {
+                    return slot.id == seq;
+                });
+                if (it == slots.end() || !it->can_speculate() || !it->get_spec()) {
+                    dflash_multiseq_block_reason = "non-dflash-slot";
+                    dflash_multiseq_block_seq = seq;
+                    return false;
+                }
+            }
+
+            dflash_multiseq_block_reason = "ok";
+            return true;
+        }();
+        if (dflash_pure_tg_batch && !dflash_tg_batch_all_spec_slots &&
+                dflash_server_crash_trace_enabled()) {
+            SRV_INF("dflash multiseq target batching disabled: reason=%s seq=%d unique=%d n_tg_tokens=%d batch_tokens=%d\n",
+                    dflash_multiseq_block_reason,
+                    (int) dflash_multiseq_block_seq,
+                    dflash_multiseq_n_unique,
+                    n_tg_tokens,
+                    batch.n_tokens);
+        }
+        const bool can_batch_multiseq = dflash_pure_tg_batch && dflash_tg_batch_all_spec_slots;
         if (can_batch_multiseq) {
             llama_set_force_split_seq(ctx_tgt, false);
         }

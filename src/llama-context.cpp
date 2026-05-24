@@ -5796,6 +5796,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         cparams.hidden_gpu_seqs[s] = nullptr;
                     }
 
+                    auto dflash_clear_graph_capture_for_view = [&]() {
+                        dflash_graph_hidden_ready = false;
+                        dflash_graph_tape_ready = false;
+                        cparams.hidden_gpu_n_seqs = 0;
+                        dflash_clear_prefill_cparams(cparams);
+
+                        bool seqs_changed = cparams.tape_gpu_n_seqs != 0 || cparams.tape_gpu != nullptr;
+                        cparams.tape_gpu_n_seqs = 0;
+                        cparams.tape_gpu = nullptr;
+                        for (int s = 0; s < (int) LLAMA_DFLASH_MAX_SLOTS; ++s) {
+                            cparams.hidden_gpu_seqs[s] = nullptr;
+                            if (cparams.tape_gpu_seqs[s] != nullptr) {
+                                seqs_changed = true;
+                            }
+                            cparams.tape_gpu_seqs[s] = nullptr;
+                        }
+
+                        if (seqs_changed && gf_res_prev) {
+                            gf_res_prev->reset();
+                        }
+                        dflash_seqs_changed = dflash_seqs_changed || seqs_changed;
+                    };
+
                     // populate per-seq DFlash GPU capture pointers for graph builder
                     const int ns = std::min((int) ubatch.n_seqs_unq, (int) LLAMA_DFLASH_MAX_SLOTS);
 
@@ -5811,34 +5834,83 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         ubatch.n_seqs_unq > 1 ? (int) ubatch.n_seq_tokens
                                                : (int) ubatch.n_tokens;
 
-                    // Choose hidden capture buffer set based on ubatch size.
-                    // For verify-sized batches (<= MAX_VERIFY_TOKENS), use the small
-                    // hidden_gpu buffers. For larger prefill suffix batches, use
-                    // prefill_gpu staging buffers when a capture plan is active.
-                    dflash_prefill_plan_active = dflash_capture->any_prefill_plan_active();
+                    bool dflash_mixed_capture_supported = true;
+                    llama_seq_id dflash_mixed_missing_seq = -1;
+                    const char * dflash_mixed_capture_reason = "ok";
+                    if (ubatch.n_seqs_unq > 1) {
+                        if (ubatch.n_seqs_unq > LLAMA_DFLASH_MAX_SLOTS) {
+                            dflash_mixed_capture_supported = false;
+                            dflash_mixed_capture_reason = "too-many-seqs";
+                        } else {
+                            for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                                const llama_seq_id seq = ubatch.seq_id_unq[s];
+                                const bool has_cpu_slot =
+                                    seq >= 0 && seq < (llama_seq_id) layer_hiddens.size();
+                                const bool has_hidden_gpu_slot =
+                                    seq >= 0 &&
+                                    seq < (llama_seq_id) dflash_capture->hidden_gpu.size() &&
+                                    dflash_capture->hidden_gpu[(size_t) seq] != nullptr;
+                                const bool has_prefill_gpu_slot =
+                                    seq >= 0 &&
+                                    seq < (llama_seq_id) dflash_capture->prefill_gpu.size() &&
+                                    dflash_capture->prefill_gpu[(size_t) seq] != nullptr;
+                                if (!has_cpu_slot && !has_hidden_gpu_slot && !has_prefill_gpu_slot) {
+                                    dflash_mixed_capture_supported = false;
+                                    dflash_mixed_missing_seq = seq;
+                                    dflash_mixed_capture_reason = "non-dflash-slot";
+                                    break;
+                                }
+                            }
+                        }
 
-                    // Decide prefill staging from the full planned suffix span, not from
-                    // the current internal ubatch. A large suffix can end with a small
-                    // internal ubatch, and that tail must still append into the same
-                    // prefill_gpu staging buffer.
-                    dflash_prefill_plan_max_tokens = dflash_capture->max_prefill_plan_tokens();
-                    const bool prefill_plan_needs_staging =
-                        dflash_prefill_plan_active &&
-                        dflash_prefill_plan_max_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS;
-
-                    dflash_use_prefill_staging = prefill_plan_needs_staging;
-
-                    if (dflash_capture && dflash_diagnostic_debug_enabled() && dflash_prefill_plan_active) {
-                        LLAMA_LOG_INFO(
-                            "%s: dflash capture route: n_tokens=%u n_seq_tokens=%u n_seqs=%u n_seqs_unq=%u capture_n_tokens=%d use_prefill_staging=%d\n",
-                            __func__,
-                            ubatch.n_tokens,
-                            ubatch.n_seq_tokens,
-                            ubatch.n_seqs,
-                            ubatch.n_seqs_unq,
-                            dflash_capture_n_tokens,
-                            dflash_use_prefill_staging ? 1 : 0);
+                        if (!dflash_mixed_capture_supported) {
+                            dflash_suppress_callback_for_view = true;
+                            dflash_gpu_capture_ready = false;
+                            dflash_clear_graph_capture_for_view();
+                            if (dflash_crash_trace_enabled() || dflash_diagnostic_debug_enabled()) {
+                                LLAMA_LOG_INFO(
+                                    "%s: dflash mixed capture suppressed: reason=%s seq=%d n_seqs_unq=%u capture_slots=%zu hidden_gpu=%zu prefill_gpu=%zu tape_gpu=%zu\n",
+                                    __func__,
+                                    dflash_mixed_capture_reason,
+                                    (int) dflash_mixed_missing_seq,
+                                    ubatch.n_seqs_unq,
+                                    layer_hiddens.size(),
+                                    dflash_capture->hidden_gpu.size(),
+                                    dflash_capture->prefill_gpu.size(),
+                                    dflash_capture->tapes.size());
+                            }
+                        }
                     }
+
+                    if (dflash_mixed_capture_supported) {
+                        // Choose hidden capture buffer set based on ubatch size.
+                        // For verify-sized batches (<= MAX_VERIFY_TOKENS), use the small
+                        // hidden_gpu buffers. For larger prefill suffix batches, use
+                        // prefill_gpu staging buffers when a capture plan is active.
+                        dflash_prefill_plan_active = dflash_capture->any_prefill_plan_active();
+
+                        // Decide prefill staging from the full planned suffix span, not from
+                        // the current internal ubatch. A large suffix can end with a small
+                        // internal ubatch, and that tail must still append into the same
+                        // prefill_gpu staging buffer.
+                        dflash_prefill_plan_max_tokens = dflash_capture->max_prefill_plan_tokens();
+                        const bool prefill_plan_needs_staging =
+                            dflash_prefill_plan_active &&
+                            dflash_prefill_plan_max_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS;
+
+                        dflash_use_prefill_staging = prefill_plan_needs_staging;
+
+                        if (dflash_capture && dflash_diagnostic_debug_enabled() && dflash_prefill_plan_active) {
+                            LLAMA_LOG_INFO(
+                                "%s: dflash capture route: n_tokens=%u n_seq_tokens=%u n_seqs=%u n_seqs_unq=%u capture_n_tokens=%d use_prefill_staging=%d\n",
+                                __func__,
+                                ubatch.n_tokens,
+                                ubatch.n_seq_tokens,
+                                ubatch.n_seqs,
+                                ubatch.n_seqs_unq,
+                                dflash_capture_n_tokens,
+                                dflash_use_prefill_staging ? 1 : 0);
+                        }
 
                     if (dflash_use_prefill_staging && dflash_gpu_capture_ready && !tree_bufs.active) {
                         // Lazy allocation of prefill staging GPU buffers on first
@@ -6061,6 +6133,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         if (seq >= 0 && seq < (int) dflash_capture->tapes.size()) {
                             dflash_capture->active_tape_idx = seq;
                         }
+                    }
                     }
 
                     dflash_skip_eval_callback =

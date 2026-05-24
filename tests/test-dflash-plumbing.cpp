@@ -1419,6 +1419,12 @@ int main(int argc, char ** argv) {
     // Non-overlapping prefill ubatches must suppress eval callback
     ok &= expect(context_cpp.find("dflash_suppress_callback_for_view") != std::string::npos,
         "decode must suppress eval callback for no-intersection prefill ubatches");
+    ok &= expect(context_cpp.find("dflash_mixed_capture_supported") != std::string::npos &&
+                 context_cpp.find("dflash mixed capture suppressed") != std::string::npos,
+        "decode must suppress DFlash capture for mixed ubatches that include non-DFlash slots");
+    ok &= expect(server_context.find("dflash_tg_batch_all_spec_slots") != std::string::npos &&
+                 server_context.find("dflash multiseq target batching disabled") != std::string::npos,
+        "server must not multi-seq batch pure TG DFlash views unless every sequence owns DFlash state");
 
     // dflash_diagnostic_debug_enabled must gate per-ubatch route logs
     ok &= expect(context_cpp.find("dflash_diagnostic_debug_enabled") != std::string::npos,
