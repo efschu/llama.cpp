@@ -494,6 +494,21 @@ int main(int argc, char ** argv) {
         cuda_ring.find("cudaPointerGetAttributes(&dst_attr", set_tensor_fn) < set_tensor_end &&
         cuda_ring.find("cudaMemcpyPeerAsync", set_tensor_fn) < set_tensor_end,
         "dflash_cross_ring_gpu_set_tensor must handle cross-device D2D copies explicitly");
+    ok &= expect(
+        cuda_ring.find("dflash_cuda_enable_peer_access") != std::string::npos &&
+        cuda_ring.find("cudaDeviceCanAccessPeer") != std::string::npos &&
+        cuda_ring.find("cudaDeviceEnablePeerAccess") != std::string::npos &&
+        cuda_ring.find("cudaErrorPeerAccessAlreadyEnabled") != std::string::npos &&
+        cuda_ring.find("GGML_CUDA_MAX_DEVICES") != std::string::npos,
+        "DFlash D2D helpers must lazily enable CUDA/ROCm peer access using GGML_CUDA_MAX_DEVICES bounds");
+    const size_t write_d2d_fn = cuda_ring.find("dflash_cross_ring_gpu_write_d2d");
+    const size_t write_d2d_end = cuda_ring.find("k_dflash_rebuild_conv_state", write_d2d_fn);
+    ok &= expect(
+        write_d2d_fn != std::string::npos &&
+        write_d2d_end != std::string::npos &&
+        cuda_ring.find("dflash_cuda_enable_peer_access(ring->device, attr.device)", write_d2d_fn) < write_d2d_end &&
+        cuda_ring.find("cudaMemcpyPeerAsync", write_d2d_fn) < write_d2d_end,
+        "DFlash hidden ring D2D writes must allow peer device pointers after enabling peer access");
     const size_t cuda_graph_check = cuda_cpp.find("static bool ggml_cuda_graph_check_compability");
     const size_t cuda_graph_check_end = cuda_cpp.find("static const void * ggml_cuda_graph_get_key", cuda_graph_check);
     ok &= expect(

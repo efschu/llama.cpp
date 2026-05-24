@@ -6,6 +6,11 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+
+#ifndef GGML_CUDA_MAX_DEVICES
+#define GGML_CUDA_MAX_DEVICES 16
+#endif
 
 // GPU cross-attention ring buffer for DFlash speculative decoding.
 
@@ -15,6 +20,67 @@ static bool dflash_cuda_debug_enabled() {
         return e && e[0] != '\0' && strcmp(e, "0") != 0;
     }();
     return v;
+}
+
+static bool dflash_cuda_enable_peer_access(int dst_device, int src_device) {
+    if (dst_device == src_device) {
+        return true;
+    }
+    if (dst_device < 0 || src_device < 0 ||
+            dst_device >= GGML_CUDA_MAX_DEVICES || src_device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+
+    static std::mutex peer_mutex;
+    static bool peer_checked[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+    static bool peer_enabled[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+    static bool peer_copy_allowed[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+
+    std::lock_guard<std::mutex> lock(peer_mutex);
+    if (peer_checked[dst_device][src_device]) {
+        return peer_copy_allowed[dst_device][src_device];
+    }
+
+    peer_checked[dst_device][src_device] = true;
+
+    int can_access = 0;
+    cudaError_t err = cudaDeviceCanAccessPeer(&can_access, dst_device, src_device);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        peer_copy_allowed[dst_device][src_device] = false;
+        return false;
+    }
+    if (!can_access) {
+        peer_copy_allowed[dst_device][src_device] = true;
+        return true;
+    }
+
+    int prev_device = -1;
+    if (cudaGetDevice(&prev_device) != cudaSuccess) {
+        cudaGetLastError();
+        prev_device = -1;
+    }
+
+    err = cudaSetDevice(dst_device);
+    if (err == cudaSuccess) {
+        err = cudaDeviceEnablePeerAccess(src_device, 0);
+        if (err == cudaErrorPeerAccessAlreadyEnabled) {
+            cudaGetLastError();
+            err = cudaSuccess;
+        } else if (err != cudaSuccess) {
+            cudaGetLastError();
+        }
+    } else {
+        cudaGetLastError();
+    }
+
+    if (prev_device >= 0) {
+        (void) cudaSetDevice(prev_device);
+    }
+
+    peer_enabled[dst_device][src_device] = (err == cudaSuccess);
+    peer_copy_allowed[dst_device][src_device] = peer_enabled[dst_device][src_device];
+    return err == cudaSuccess;
 }
 
 // GPU cross-attention ring buffer for DFlash speculative decoding.
@@ -194,11 +260,11 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
         return false;
     }
 #if CUDART_VERSION >= 10000 || defined(GGML_USE_HIP)
-    if (attr.type != cudaMemoryTypeDevice || attr.device != ring->device) {
+    if (attr.type != cudaMemoryTypeDevice) {
         return false;
     }
 #else
-    if (attr.memoryType != cudaMemoryTypeDevice || attr.device != ring->device) {
+    if (attr.memoryType != cudaMemoryTypeDevice) {
         return false;
     }
 #endif
@@ -219,14 +285,30 @@ extern "C" bool dflash_cross_ring_gpu_write_d2d(
     }
 
     int first = ring->ring_size - pos;
-    if (first >= n_tokens) {
-        cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
-                        (size_t)n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+    if (attr.device != ring->device) {
+        if (!dflash_cuda_enable_peer_access(ring->device, attr.device)) {
+            return false;
+        }
+
+        if (first >= n_tokens) {
+            cudaMemcpyPeerAsync(dst + (size_t)pos * n_embd, ring->device, src, attr.device,
+                    (size_t)n_tokens * stride, cudaStreamPerThread);
+        } else {
+            cudaMemcpyPeerAsync(dst + (size_t)pos * n_embd, ring->device, src, attr.device,
+                    (size_t)first * stride, cudaStreamPerThread);
+            cudaMemcpyPeerAsync(dst, ring->device, src + (size_t)first * stride, attr.device,
+                    (size_t)(n_tokens - first) * stride, cudaStreamPerThread);
+        }
     } else {
-        cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
-                        (size_t)first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
-        cudaMemcpyAsync(dst, src + (size_t)first * stride,
-                        (size_t)(n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        if (first >= n_tokens) {
+            cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
+                            (size_t)n_tokens * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        } else {
+            cudaMemcpyAsync(dst + (size_t)pos * n_embd, src,
+                            (size_t)first * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            cudaMemcpyAsync(dst, src + (size_t)first * stride,
+                            (size_t)(n_tokens - first) * stride, cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+        }
     }
 
     return cudaGetLastError() == cudaSuccess;
@@ -518,6 +600,9 @@ extern "C" void dflash_cross_ring_gpu_set_tensor(
 #endif
 
     if (dst_is_device && src_is_device && dst_attr.device != src_attr.device) {
+        if (!dflash_cuda_enable_peer_access(dst_attr.device, src_attr.device)) {
+            return;
+        }
         cudaSetDevice(dst_attr.device);
         cudaMemcpyPeerAsync(dst, dst_attr.device, d_src, src_attr.device, size, cudaStreamPerThread);
     } else {
