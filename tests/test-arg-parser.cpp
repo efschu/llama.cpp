@@ -138,14 +138,26 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.n_max == 16);
     assert(params.speculative.draft.n_max == 16);
-    assert(params.speculative.draft.n_ctx == params.speculative.dflash_cross_ctx + 16);
+    assert(params.speculative.draft.n_ctx == 256);
 
     params = common_params();
     argv = {"binary_name", "--spec-type", "dflash", "--spec-draft-n-max", "7"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.n_max == 7);
     assert(params.speculative.draft.n_max == 7);
-    assert(params.speculative.draft.n_ctx == params.speculative.dflash_cross_ctx + 7);
+    assert(params.speculative.draft.n_ctx == 256);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "dflash", "--spec-dflash-cross-ctx", "1024"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.dflash_cross_ctx == 1024);
+    assert(params.speculative.draft.n_ctx == 256);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "dflash", "--spec-dflash-cross-ctx", "1024", "-cd", "1040"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.dflash_cross_ctx == 1024);
+    assert(params.speculative.draft.n_ctx == 1040);
 
     params = common_params();
     argv = {"binary_name", "--spec-dm-min-reach", "6"};

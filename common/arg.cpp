@@ -1088,12 +1088,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             };
             const bool b_passed   = arg_passed({"-b", "--batch-size"});
             const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
-            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft"});
+            const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft", "--spec-draft-ctx-size"});
 
             if (!cd_passed && params.speculative.draft.n_ctx == 0) {
-                params.speculative.draft.n_ctx = params.speculative.dflash_cross_ctx + params.speculative.draft.n_max;
-                LOG_INF("dflash: setting -cd to %d (cross window + draft horizon; pass -cd N to override)\n",
-                        params.speculative.draft.n_ctx);
+                params.speculative.draft.n_ctx = 256;
+                LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
             }
             bool capped = false;
             if (!b_passed && params.n_batch > 256) {
@@ -3999,6 +3998,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-ctx-size", "-cd", "--ctx-size-draft"}, "N",
+        string_format("size of the prompt context for the draft model (default: %d, 0 = loaded from model)", params.speculative.draft.n_ctx),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CTX_SIZE"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

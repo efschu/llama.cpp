@@ -343,8 +343,9 @@ int main(int argc, char ** argv) {
     ok &= expect(speculative.find("llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, committed_len, -1);") != std::string::npos &&
                  speculative.find("llama_memory_seq_rm(llama_get_memory(ctx_dft), rs.seq_id, rs.draft_pos_base, -1);") != std::string::npos,
         "DFlash drafter must trim each slot back to its accepted prefix before the next block draft so stale proposal state cannot survive into the next cycle");
-    ok &= expect(arg_cpp.find("params.speculative.dflash_cross_ctx + params.speculative.draft.n_max") != std::string::npos,
-        "DFlash default -cd must scale with the active cross window instead of staying fixed at 256");
+    ok &= expect(arg_cpp.find("params.speculative.draft.n_ctx = 256;") != std::string::npos &&
+                 arg_cpp.find("drafter doesn't need the full main ctx") != std::string::npos,
+        "DFlash default -cd must stay at the production 256-token drafter context unless the user overrides it");
     ok &= expect(speculative.find("float * logits = llama_get_logits_ith(ctx_dft, i);") != std::string::npos, "DFlash flat draft fallback rows must preserve seed-token offset");
     ok &= expect(speculative.find("const int offset = r * batch_len;") != std::string::npos, "DFlash batched draft argmax row offsets must preserve seed-token output rows");
     ok &= expect(speculative.find("graph_reuse=%d") != std::string::npos, "DFlash draft profile must report drafter graph reuse");
