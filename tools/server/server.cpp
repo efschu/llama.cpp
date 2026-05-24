@@ -127,9 +127,6 @@ int llama_server(int argc, char ** argv) {
     // struct that contains llama context and inference
     server_context ctx_server;
 
-    llama_backend_init();
-    llama_numa_init(params.numa);
-
     if (params.measure_only) {
         llama_model_params mparams = common_model_params_to_llama(params);
         mparams.no_alloc  = true;
