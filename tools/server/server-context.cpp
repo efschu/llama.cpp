@@ -18,6 +18,7 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "src/dflash-profile.h"
+#include "src/llama-ext.h"
 #include "src/llama-memory.h"
 
 #include <algorithm>
@@ -2012,7 +2013,7 @@ private:
 
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH && !draft_devices_explicit) {
                 params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
-                SRV_INF("DFlash draft model will use a single device by default; pass --spec-draft-device to override\n");
+                SRV_INF("%s", "DFlash draft model will use a single device by default; pass --spec-draft-device to override\n");
             }
 
             if (params_spec.cpuparams.n_threads > 0) {
@@ -2033,7 +2034,7 @@ private:
             // Auto-detect DFlash from complete drafter metadata.
             bool draft_is_dflash = server_model_is_dflash_drafter(model_dft.get());
             if (draft_is_dflash && !draft_devices_explicit && llama_model_n_devices(model_dft.get()) > 1) {
-                SRV_INF("reloading auto-detected DFlash draft model on a single device; pass --spec-draft-device to override\n");
+                SRV_INF("%s", "reloading auto-detected DFlash draft model on a single device; pass --spec-draft-device to override\n");
                 model_dft.reset();
                 params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;
                 mparams_dft = common_model_params_to_llama(params_dft);

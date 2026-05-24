@@ -1540,7 +1540,11 @@ int main(int argc, char ** argv) {
                  server_context.find("llama_model_dflash_n_target_features(model)") != std::string::npos,
         "server DFlash auto-detection must require complete DFlash metadata, not the default block size");
     ok &= expect(server_context.find("const bool draft_devices_explicit = !params_spec.devices.empty();") != std::string::npos &&
-                 server_context.find("params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;") != std::string::npos,
+                 server_context.find("#include \"src/llama-ext.h\"") != std::string::npos &&
+                 server_context.find("params_dft.split_mode = LLAMA_SPLIT_MODE_NONE;") != std::string::npos &&
+                 server_context.find("llama_model_n_devices(model_dft.get()) > 1") != std::string::npos &&
+                 server_context.find("SRV_INF(\"%s\", \"DFlash draft model will use a single device by default") != std::string::npos &&
+                 server_context.find("SRV_INF(\"%s\", \"reloading auto-detected DFlash draft model on a single device") != std::string::npos,
         "DFlash draft model loading must default to one device unless --spec-draft-device is explicit");
     ok &= expect(model_cpp.find("!llm_arch_is_dflash_drafter(model->arch)") != std::string::npos,
         "public DFlash hparam accessors must return zero for non-DFlash model architectures");
