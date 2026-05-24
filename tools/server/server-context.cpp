@@ -1636,6 +1636,7 @@ private:
     int  n_parallel_user = 0;
     int  n_seq_max_full = 0;      // target n_seq_max after expansion (2*n_parallel_user)
     bool recurrent_expanded = true; // false = backup cells deferred, expand before first draft
+    bool dflash_shared_drafter_batch_recurrent_logged = false;
 
     int32_t n_ctx; // total context for all clients / slots
 
@@ -1865,6 +1866,27 @@ private:
         GGML_ABORT("failed to expand recurrent state after prompt cache restore; continuing would make scheduler reservation inconsistent\n");
     }
 
+    bool dflash_shared_drafter_batch_allowed(int n_drafting) {
+        if (n_drafting < 2) {
+            return false;
+        }
+        if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH ||
+                params_base.speculative.branch_budget != 0) {
+            return false;
+        }
+
+        const bool target_non_recurrent = !needs_reeval;
+        if (!target_non_recurrent) {
+            if (!dflash_shared_drafter_batch_recurrent_logged) {
+                SRV_WRN("%s", "DFlash shared drafter batching disabled: reason=target-recurrent; using per-slot DFlash drafts for recurrent/hybrid target correctness\n");
+                dflash_shared_drafter_batch_recurrent_logged = true;
+            }
+            return false;
+        }
+
+        return target_non_recurrent;
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1887,6 +1909,7 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        dflash_shared_drafter_batch_recurrent_logged = false;
 
         const std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
@@ -3877,11 +3900,11 @@ private:
                     n_drafting++;
                 }
             }
-            llama_set_dflash_n_slots(ctx_dft_shared.get(), std::max(1, n_drafting));
+            const bool can_shared_drafter_batch = dflash_shared_drafter_batch_allowed(n_drafting);
+            const int shared_drafter_slots = can_shared_drafter_batch ? std::max(1, n_drafting) : 1;
+            llama_set_dflash_n_slots(ctx_dft_shared.get(), shared_drafter_slots);
 
-            if (n_drafting >= 2 &&
-                    params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                    params_base.speculative.branch_budget == 0) {
+            if (can_shared_drafter_batch) {
                 std::vector<common_speculative *> batch_specs;
                 std::vector<llama_token>          batch_id_lasts;
                 std::vector<int>                  batch_slot_ids;
@@ -5162,6 +5185,15 @@ private:
                     dflash_view_has_unexpected_prompt_logits(batch_view, slots)) {
                 SRV_INF("dflash prompt logits diagnostic: view_start=%d n_tokens=%d has unexpected prompt raw logits outside final sampling row\n",
                         i, n_tokens);
+            }
+
+            if (needs_reeval && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                // DFlash: a previous async rollback replay can remain pending when the next
+                // cycle falls back to a plain target decode. Sync here so recurrent memory
+                // positions and state are current before any target ubatch is scheduled.
+                const int64_t t_replay_sync_start = dflash_profile_start();
+                llama_tape_replay_sync(ctx_tgt);
+                dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
             }
 
             const int64_t t_verify_start = ggml_time_us();

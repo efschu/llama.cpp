@@ -3542,6 +3542,12 @@ private:
         if (ring_write_discarded) {
             return;
         }
+        if (actual_written != n_accepted) {
+            LOG_ERR("dflash: incomplete target hidden capture: requested=%d written=%d; refusing to advance DFlash ring\n",
+                    n_accepted, actual_written);
+            discard_cross_ring("incomplete target hidden capture");
+            return;
+        }
         committed_len += actual_written;
         update_drafter_kv_cache(actual_written);
     }

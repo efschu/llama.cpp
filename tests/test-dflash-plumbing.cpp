@@ -1501,6 +1501,25 @@ int main(int argc, char ** argv) {
         "DFlash drafter KV retention must use partitioned per-slot context, not a unified shared pool");
     ok &= expect(server_context.find("reduced-row-count-mismatch") != std::string::npos,
         "DFlash reduced verifier must reject uneven multi-slot rows so compact output is not overwritten by internal ubatch splits");
+    ok &= expect(server_context.find("dflash_shared_drafter_batch_allowed") != std::string::npos &&
+                 server_context.find("target-recurrent") != std::string::npos &&
+                 server_context.find("!needs_reeval") != std::string::npos,
+        "DFlash shared drafter batching must be disabled for recurrent/hybrid targets until cross-slot recurrent isolation is proven");
+    ok &= expect(speculative.find("actual_written != n_accepted") != std::string::npos &&
+                 speculative.find("incomplete target hidden capture") != std::string::npos &&
+                 speculative.find("refusing to advance DFlash ring") != std::string::npos,
+        "DFlash must discard partial hidden captures instead of advancing the cross-ring with missing accepted rows");
+    {
+        const size_t sync_comment = server_context.find("DFlash: a previous async rollback replay");
+        const size_t sync_call    = server_context.find("llama_tape_replay_sync(ctx_tgt);", sync_comment);
+        const size_t target_decode = server_context.find("const int ret = llama_decode(ctx_tgt, batch_view);");
+        ok &= expect(sync_comment != std::string::npos &&
+                     sync_call    != std::string::npos &&
+                     target_decode != std::string::npos &&
+                     sync_comment < sync_call &&
+                     sync_call < target_decode,
+            "DFlash must synchronize pending recurrent tape replay immediately before every target decode, including non-spec fallback after a rejected draft");
+    }
 
     // dflash_diagnostic_debug_enabled must gate per-ubatch route logs
     ok &= expect(context_cpp.find("dflash_diagnostic_debug_enabled") != std::string::npos,
