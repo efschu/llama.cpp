@@ -359,6 +359,8 @@ enum common_speculative_dm_controller {
     COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
 };
 
+static constexpr int32_t COMMON_SPECULATIVE_DFLASH_DEFAULT_N_MAX = 16;
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
@@ -374,13 +376,12 @@ struct common_params_speculative {
 
     // DFlash-specific params (top-level for fork compat)
     int32_t n_max        = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_max_base   = 0;  // user's original --draft-max before adaptive DM reduction (0 = use n_max)
+    int32_t n_max_base   = 0;  // user's original --spec-draft-n-max before adaptive DM reduction (0 = use n_max)
     int32_t n_min        = 0;  // minimum number of draft tokens to use for speculative decoding
     bool    n_max_explicit = false; // user explicitly set draft max; preserve across DFlash normalization
     int32_t branch_budget = 0; // DDTree branch nodes beyond the main draft path (0 = flat DFlash)
-    int32_t tree_budget   = -1; // legacy total-node --tree-budget input; normalized after parsing
     bool    branch_budget_explicit = false;
-    bool    legacy_tree_budget_explicit = false;
+    bool    dflash_only_args_explicit = false; // preserve DFlash-only args until draft-model auto-detect resolves
     int32_t dflash_max_slots = 0; // max DFlash slots; 0 = match n_parallel / -np
     float   p_split = 0.1f;   // speculative decoding split probability
     float   p_min   = 0.0f;   // minimum speculative decoding probability (0 = disabled)
@@ -442,6 +443,54 @@ struct common_params_speculative {
 
     void set_type(common_speculative_type t) {
         types = { t };
+    }
+
+    void note_dflash_only_arg() {
+        dflash_only_args_explicit = true;
+    }
+
+    void apply_dflash_effective_defaults() {
+        if (!n_max_explicit) {
+            n_max = COMMON_SPECULATIVE_DFLASH_DEFAULT_N_MAX;
+            draft.n_max = n_max;
+        } else {
+            n_max = draft.n_max;
+        }
+        n_min = draft.n_min;
+        branch_budget = std::max(0, branch_budget);
+        if (branch_budget == 0) {
+            draft_topk = 1;
+        }
+    }
+
+    void reset_dflash_only_args() {
+        branch_budget = 0;
+        branch_budget_explicit = false;
+        dflash_max_slots = 0;
+        p_split = 0.1f;
+        sample_temp = 0.0f;
+        draft_topk = 1;
+        dflash_cross_ctx = 512;
+
+        dm_adaptive         = true;
+        dm_fringe_min       = 0.30f;
+        dm_fringe_max       = 0.50f;
+        dm_off_dwell        = 8;
+        dm_explore_interval = 12;
+        dm_min_reach        = 3;
+        dm_probe_interval   = 16;
+        dm_probe_fraction   = 0.25f;
+        dm_fringe_window    = 3;
+        dm_controller       = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+        dm_profit_min          = 0.05f;
+        dm_profit_raise_margin = 0.05f;
+        dm_profit_lower_margin = 0.05f;
+        dm_profit_ewma_alpha   = 0.15f;
+        dm_profit_min_samples  = 3;
+        dm_profit_warmup       = 0;
+        dm_profit_baseline_interval = 1024;
+
+        dflash_only_args_explicit = false;
     }
 
     uint32_t need_n_rs_seq() const {

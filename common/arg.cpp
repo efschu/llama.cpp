@@ -953,23 +953,17 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
 static void common_params_speculative_normalize(common_params & params) {
     auto & s = params.speculative;
     const bool has_dflash = std::find(s.types.begin(), s.types.end(), COMMON_SPECULATIVE_TYPE_DFLASH) != s.types.end();
+    const bool may_auto_detect_dflash = !has_dflash && s.type() == COMMON_SPECULATIVE_TYPE_NONE && s.has_dft();
 
-    if (has_dflash && !s.n_max_explicit) {
-        s.draft.n_max = s.n_max;
+    if (has_dflash) {
+        s.apply_dflash_effective_defaults();
     } else {
         s.n_max = s.draft.n_max;
-    }
-    s.n_min = s.draft.n_min;
-
-    if (s.legacy_tree_budget_explicit && !s.branch_budget_explicit) {
-        s.branch_budget = std::max(0, s.tree_budget - std::max(0, s.n_max));
-    } else if (s.legacy_tree_budget_explicit && s.branch_budget_explicit) {
-        LOG_WRN("warning: both --spec-branch-budget and legacy --tree-budget were supplied; ignoring --tree-budget\n");
-    }
-
-    s.branch_budget = std::max(0, s.branch_budget);
-    if (s.branch_budget == 0) {
-        s.draft_topk = 1;
+        s.n_min = s.draft.n_min;
+        if (s.dflash_only_args_explicit && !may_auto_detect_dflash) {
+            LOG_WRN("warning: DFlash-only speculative args were supplied without DFlash; ignoring them\n");
+            s.reset_dflash_only_args();
+        }
     }
 }
 
@@ -1066,16 +1060,9 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         params.lr.init();
         common_validate_reasoning_loop_guard_params(params.reasoning_loop_guard);
 
-        // DFlash-safe defaults. The drafter's block_size=16 / internal max
-        // batch=64 means it only needs a tiny graph, and multi-slot target
-        // activation memory scales as n_ubatch * n_parallel — stock ub=512
-        // with np=auto=4 OOMs a 24 GB GPU. So cap to keep first-run users
-        // from hitting OOM. The tradeoff: target prefill is ~30% slower at
-        // ub=64 vs ub=512. Users who want faster prefill pass -ub explicitly
-        // (and can also pass -b to keep -b >= -ub).
-        // We scan argv instead of comparing to params_org because the stock
-        // default is 2048 — a user passing `-b 2048` to lift the cap would
-        // look identical to not passing anything with a naive value check.
+        // DFlash only needs a small drafter context by default. Keep upstream
+        // target -b/-ub defaults unchanged; prompt prefill performance depends
+        // on them and DFlash can be auto-detected later in server startup.
         if (std::find(params.speculative.types.begin(), params.speculative.types.end(),
                       COMMON_SPECULATIVE_TYPE_DFLASH) != params.speculative.types.end()) {
             auto arg_passed = [argc, argv](std::initializer_list<const char *> names) {
@@ -1086,26 +1073,11 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
                 }
                 return false;
             };
-            const bool b_passed   = arg_passed({"-b", "--batch-size"});
-            const bool ub_passed  = arg_passed({"-ub", "--ubatch-size"});
             const bool cd_passed  = arg_passed({"-cd", "--ctx-size-draft", "--spec-draft-ctx-size"});
 
             if (!cd_passed && params.speculative.draft.n_ctx == 0) {
                 params.speculative.draft.n_ctx = 256;
                 LOG_INF("dflash: setting -cd to 256 (drafter doesn't need the full main ctx; pass -cd N to override)\n");
-            }
-            bool capped = false;
-            if (!b_passed && params.n_batch > 256) {
-                params.n_batch = 256;
-                capped = true;
-            }
-            if (!ub_passed && params.n_ubatch > 64) {
-                params.n_ubatch = 64;
-                capped = true;
-            }
-            if (capped) {
-                LOG_INF("dflash: capped -b/-ub to 256/64 for OOM safety. "
-                        "Pass -ub 512 -b 2048 for ~30%% faster prompt prefill at +2-3 GB VRAM.\n");
             }
         }
     } catch (const std::invalid_argument & ex) {
@@ -3736,43 +3708,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--draft", "--draft-n", "--draft-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.n_max),
-        [](common_params & params, int value) {
-            params.speculative.draft.n_max = value;
-            params.speculative.n_max       = value;
-            params.speculative.n_max_explicit = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
-    add_opt(common_arg(
-        {"--draft-min", "--draft-n-min"}, "N",
-        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.n_min),
-        [](common_params & params, int value) {
-            params.speculative.draft.n_min = value;
-            params.speculative.n_min       = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
-    add_opt(common_arg(
         {"--spec-branch-budget"}, "N",
         string_format("DDTree branch nodes beyond the main draft path (default: %d, 0 = flat)", params.speculative.branch_budget),
         [](common_params & params, int value) {
             params.speculative.branch_budget = std::max(0, value);
             params.speculative.branch_budget_explicit = true;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_BRANCH_BUDGET"));
-    add_opt(common_arg(
-        {"--tree-budget"}, "N",
-        "legacy total DDTree node budget; converted to --spec-branch-budget=max(0, tree-budget - draft-max)",
-        [](common_params & params, int value) {
-            params.speculative.tree_budget = std::max(0, value);
-            params.speculative.legacy_tree_budget_explicit = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TREE_BUDGET"));
     add_opt(common_arg(
         {"--spec-dflash-max-slots", "--dflash-max-slots"}, "N",
         "max concurrent server slots with DFlash state; higher slots fall back to non-speculative decode (default: match -np)",
         [](common_params & params, int value) {
             params.speculative.dflash_max_slots = std::max(0, value);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_DFLASH_MAX_SLOTS"));
     add_opt(common_arg(
@@ -3780,6 +3729,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("DFlash cross-attention window in tokens; how many target hidden states the drafter sees (default: %d)", params.speculative.dflash_cross_ctx),
         [](common_params & params, int value) {
             params.speculative.dflash_cross_ctx = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_SPECULATIVE}).set_env("LLAMA_ARG_SPEC_DFLASH_CROSS_CTX"));
     add_opt(common_arg(
@@ -3787,6 +3737,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("top-K candidates per drafter position for tree branching (default: %d)", params.speculative.draft_topk),
         [](common_params & params, int value) {
             params.speculative.draft_topk = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TOP_K"));
     add_opt(common_arg(
@@ -3798,6 +3749,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 params.speculative.sample_temp = std::stof(value);
             }
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DRAFT_TEMP"));
     add_opt(common_arg(
@@ -3806,6 +3758,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("enable adaptive draft-max controller (default: %s)", params.speculative.dm_adaptive ? "true" : "false"),
         [](common_params & params, bool value) {
             params.speculative.dm_adaptive = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_ADAPTIVE"));
     add_opt(common_arg(
@@ -3813,6 +3766,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("fringe controller only: rate below which DFlash is disabled after off-dwell (default: %.2f)", (double) params.speculative.dm_fringe_min),
         [](common_params & params, const std::string & value) {
             params.speculative.dm_fringe_min = std::clamp(std::stof(value), 0.0f, 1.0f);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_FRINGE_MIN"));
     add_opt(common_arg(
@@ -3820,6 +3774,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("fringe controller only: rate above which full base_n_max is used (default: %.2f)", (double) params.speculative.dm_fringe_max),
         [](common_params & params, const std::string & value) {
             params.speculative.dm_fringe_max = std::clamp(std::stof(value), 0.0f, 1.0f);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_FRINGE_MAX"));
     add_opt(common_arg(
@@ -3827,6 +3782,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("consecutive weak spec cycles before DFlash is disabled (default: %d)", params.speculative.dm_off_dwell),
         [](common_params & params, int value) {
             params.speculative.dm_off_dwell = std::max(1, value);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_OFF_DWELL"));
     add_opt(common_arg(
@@ -3834,6 +3790,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("draft at an exploratory depth every N spec cycles (default: %d)", params.speculative.dm_explore_interval),
         [](common_params & params, int value) {
             params.speculative.dm_explore_interval = std::max(1, value);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_EXPLORE_INTERVAL"));
     add_opt(common_arg(
@@ -3841,6 +3798,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("fringe controller only: min current-epoch samples at target position before promotion (default: %d)", params.speculative.dm_min_reach),
         [](common_params & params, int value) {
             params.speculative.dm_min_reach = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_MIN_REACH"));
     add_opt(common_arg(
@@ -3848,6 +3806,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("cycles to wait before probing with n_max>0 when DM is disabled (default: %d)", params.speculative.dm_probe_interval),
         [](common_params & params, int value) {
             params.speculative.dm_probe_interval = std::max(1, value);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROBE_INTERVAL"));
     add_opt(common_arg(
@@ -3855,6 +3814,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("fraction of base n_max to use when probing from disabled state (default: %.2f)", (double) params.speculative.dm_probe_fraction),
         [](common_params & params, const std::string & value) {
             params.speculative.dm_probe_fraction = std::clamp(std::stof(value), 0.01f, 1.0f);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROBE_FRACTION"));
     add_opt(common_arg(
@@ -3863,6 +3823,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             common_speculative_dm_controller_name(params.speculative.dm_controller)),
         [](common_params & params, const std::string & value) {
             params.speculative.dm_controller = common_speculative_dm_controller_from_name(value);
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_CONTROLLER"));
     add_opt(common_arg(
@@ -3874,6 +3835,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-min must be in [0.0, 0.50]");
             }
             params.speculative.dm_profit_min = f;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN"));
     add_opt(common_arg(
@@ -3885,6 +3847,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-raise-margin must be in [0.0, 1.0]");
             }
             params.speculative.dm_profit_raise_margin = f;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN"));
     add_opt(common_arg(
@@ -3896,6 +3859,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-lower-margin must be in [0.0, 1.0]");
             }
             params.speculative.dm_profit_lower_margin = f;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN"));
     add_opt(common_arg(
@@ -3907,6 +3871,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-ewma-alpha must be in [0.01, 1.0]");
             }
             params.speculative.dm_profit_ewma_alpha = f;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_EWMA_ALPHA"));
     add_opt(common_arg(
@@ -3917,6 +3882,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-min-samples must be in [1, 64]");
             }
             params.speculative.dm_profit_min_samples = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES"));
     add_opt(common_arg(
@@ -3927,6 +3893,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-warmup must be in [0, 64]");
             }
             params.speculative.dm_profit_warmup = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_WARMUP"));
     add_opt(common_arg(
@@ -3937,6 +3904,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("spec-dm-profit-baseline-interval must be in [0, 4096]");
             }
             params.speculative.dm_profit_baseline_interval = value;
+            params.speculative.note_dflash_only_arg();
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL"));
     add_opt(common_arg(
@@ -4577,19 +4545,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             //params.speculative.ngram_map_k4v.min_hits = 2;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
-
-    add_opt(common_arg(
-        {"--spec-dflash-default"},
-        string_format("enable default DFlash speculative decoding config (requires -md)"),
-        [](common_params & params) {
-            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DFLASH };
-            params.speculative.p_min = 0.0f;
-            params.speculative.n_max = 16;
-            params.speculative.draft.n_max = 16;
-            params.speculative.n_max_explicit = true;
-            params.speculative.n_min = 0;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE}));
 
     return ctx_arg;
 }

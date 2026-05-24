@@ -2067,8 +2067,15 @@ private:
             if (draft_is_dflash &&
                 params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
                 params_base.speculative.set_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+                params_base.speculative.apply_dflash_effective_defaults();
                 SRV_INF("auto-detected DFlash drafter (block_size=%d)\n",
                         llama_model_dflash_block_size(model_dft.get()));
+            }
+
+            if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                params_base.speculative.dflash_only_args_explicit) {
+                SRV_WRN("%s", "DFlash-only speculative args were supplied but the draft model is not DFlash; ignoring them\n");
+                params_base.speculative.reset_dflash_only_args();
             }
 
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
@@ -2076,6 +2083,13 @@ private:
                     SRV_ERR("draft model '%s' is not a valid DFlash drafter: missing complete DFlash metadata\n",
                             params_dft.model.path.c_str());
                     return false;
+                }
+                if (params_base.speculative.draft.n_ctx == 0) {
+                    params_base.speculative.draft.n_ctx = 256;
+                    params_dft.n_ctx = params_base.speculative.draft.n_ctx;
+                    params_dft.n_batch = params_dft.n_ctx;
+                    SRV_INF("dflash: setting -cd to %d after draft-model auto-detect (pass -cd N to override)\n",
+                            params_base.speculative.draft.n_ctx);
                 }
                 const int block_size = llama_model_dflash_block_size(model_dft.get());
                 const int dflash_draft_slots = params_base.speculative.dflash_max_slots > 0
@@ -2293,7 +2307,11 @@ private:
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
             slot.reject_rng.seed(i + 1);
-            slot.dm_adaptive         = params_base.speculative.dm_adaptive;
+            const bool slot_dflash = can_spec &&
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                i < dflash_slots_cap;
+
+            slot.dm_adaptive         = slot_dflash && params_base.speculative.dm_adaptive;
             slot.dm_fringe_min       = params_base.speculative.dm_fringe_min;
             slot.dm_fringe_max       = params_base.speculative.dm_fringe_max;
             slot.dm_off_dwell        = params_base.speculative.dm_off_dwell;
@@ -2312,7 +2330,7 @@ private:
             slot.dm_profit_baseline_interval = params_base.speculative.dm_profit_baseline_interval;
 
             const bool slot_can_spec = can_spec &&
-                (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || i < dflash_slots_cap);
+                (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH || slot_dflash);
 
             if (slot_can_spec) {
                 try {
