@@ -688,35 +688,53 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-static bool common_sampler_has_speculative_unsafe_grammar(const struct common_sampler * gsmpl) {
+bool common_sampler_has_active_grammar(const struct common_sampler * gsmpl) {
     if (!gsmpl || !gsmpl->grmr) {
         return false;
     }
 
     // Lazy grammars are safe to speculate while still awaiting their trigger.
-    // Once triggered, grammar-constrained regions need normal full-vocab
-    // sampling and one-token streaming/parser boundaries.
+    // Once triggered, shortcuts that bypass grammar-masked sampling are unsafe.
     return llama_sampler_grammar_is_active(gsmpl->grmr);
+}
+
+bool common_sampler_reasoning_is_forcing(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return true;
+    }
+
+    return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
 }
 
 bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return true;
     }
-    if (common_sampler_has_speculative_unsafe_grammar(gsmpl)) {
+    if (common_sampler_has_active_grammar(gsmpl)) {
         return true;
     }
-    return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
+    return common_sampler_reasoning_is_forcing(gsmpl);
+}
+
+bool common_sampler_stops_speculative_accept(const struct common_sampler * gsmpl, bool grammar_active_at_start) {
+    if (!gsmpl) {
+        return true;
+    }
+    if (common_sampler_reasoning_is_forcing(gsmpl)) {
+        return true;
+    }
+
+    return common_sampler_has_active_grammar(gsmpl) && !grammar_active_at_start;
 }
 
 bool common_sampler_supports_reduced(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return false;
     }
-    if (common_sampler_has_speculative_unsafe_grammar(gsmpl)) {
+    if (common_sampler_has_active_grammar(gsmpl)) {
         return false;
     }
-    if (common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING) {
+    if (!common_sampler_reasoning_is_forcing(gsmpl)) {
         return true;
     }
     return false;
@@ -728,6 +746,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const bool grammar_active_at_start = common_sampler_has_active_grammar(gsmpl);
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -736,7 +756,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (common_sampler_blocks_speculative(gsmpl)) {
+        if (common_sampler_stops_speculative_accept(gsmpl, grammar_active_at_start)) {
             break;
         }
 
@@ -816,6 +836,8 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
     std::vector<llama_token> result;
     result.reserve((size_t) n_rows);
 
+    const bool grammar_active_at_start = common_sampler_has_active_grammar(gsmpl);
+
     size_t i = 0;
     for (; i < draft.size(); ++i) {
         const llama_token id = sample_row((int32_t) i);
@@ -826,7 +848,7 @@ std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
         common_sampler_accept(gsmpl, id, true);
         result.push_back(id);
 
-        if (common_sampler_blocks_speculative(gsmpl)) {
+        if (common_sampler_stops_speculative_accept(gsmpl, grammar_active_at_start)) {
             break;
         }
 

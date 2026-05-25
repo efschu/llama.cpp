@@ -924,12 +924,17 @@ int main(int argc, char ** argv) {
     ok &= expect(cuda_argmax.find("const float raw_logit = heap_idx[i] >= 0 ? rowx[heap_idx[i]] : -FLT_MAX;") != std::string::npos, "CUDA deterministic top-K must return raw logits, not zero scores");
     ok &= expect(cuda_argmax.find("cub::DeviceTopK::MaxPairs") != std::string::npos, "CUDA deterministic top-K must use CUB fast path when available");
     ok &= expect(sampling_h.find("common_sampler_sample_reduced_and_accept_n") != std::string::npos, "common sampler must expose reduced-candidate verifier sampling");
-    ok &= expect(sampling_h.find("common_sampler_blocks_speculative") != std::string::npos, "common sampler must expose grammar/reasoning guard for speculative decoding");
+    ok &= expect(sampling_h.find("common_sampler_has_active_grammar") != std::string::npos, "common sampler must expose active grammar state separately from hard speculative stops");
+    ok &= expect(sampling_h.find("common_sampler_reasoning_is_forcing") != std::string::npos, "common sampler must expose reasoning-forcing state as the hard DFlash draft stop");
+    ok &= expect(sampling_h.find("common_sampler_stops_speculative_accept") != std::string::npos, "common sampler must expose per-cycle grammar transition stops for speculative accept");
     ok &= expect(sampling_cpp.find("Lazy grammars are safe to speculate while still awaiting their trigger") != std::string::npos, "speculative guard must keep DFlash available before lazy grammar triggers");
-    ok &= expect(sampling_cpp.find("if (common_sampler_blocks_speculative(gsmpl))") != std::string::npos, "speculative accept must stop when a token activates grammar/reasoning boundaries");
+    ok &= expect(sampling_cpp.find("const bool grammar_active_at_start = common_sampler_has_active_grammar(gsmpl);") != std::string::npos,
+        "speculative accept must snapshot whether grammar was already active at cycle start");
+    ok &= expect(sampling_cpp.find("common_sampler_stops_speculative_accept(gsmpl, grammar_active_at_start)") != std::string::npos,
+        "speculative accept must stop only when a token newly activates grammar or reasoning-forcing boundaries");
     ok &= expect(sampling_cpp.find("llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p)") != std::string::npos, "reduced verifier must still run the sampler chain");
     ok &= expect(sampling_cpp.find("gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false }") != std::string::npos, "reduced verifier sampler must tolerate unsorted GPU top-K candidates");
-    ok &= expect(sampling_cpp.find("common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING") != std::string::npos, "reduced verifier must allow passthrough reasoning-budget tracking");
+    ok &= expect(sampling_cpp.find("!common_sampler_reasoning_is_forcing(gsmpl)") != std::string::npos, "reduced verifier must allow passthrough reasoning-budget tracking");
     ok &= expect(sampling_cpp.find("llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p)") != std::string::npos, "reduced verifier must preserve reasoning-budget sampler state");
     ok &= expect(sampling_cpp.find("common_reasoning_budget_next_forced_token(gsmpl->rbudget)") != std::string::npos,
         "reduced verifier must emit the deterministic forced reasoning-end token when EOG starts forcing");
@@ -942,8 +947,23 @@ int main(int argc, char ** argv) {
         "server reduced verifier eligibility must use the active slot/request sampling params");
     ok &= expect(server_context.find("top-k-mismatch") != std::string::npos,
         "batched reduced verifier must reject mixed top-K requirements under one target graph");
-    ok &= expect(server_context.find("common_sampler_blocks_speculative(slot.smpl.get())") != std::string::npos, "DFlash server path must skip drafting when grammar/reasoning guard requires full sampling");
-    ok &= expect(server_context.find("common_sampler_blocks_speculative(smpl)") != std::string::npos, "DFlash rejection sampling must stop at grammar/reasoning boundaries");
+    ok &= expect(server_context.find("\n        if (common_sampler_blocks_speculative(smpl.get())) {\n            return 0;\n        }\n\n        const int n_draft_min") == std::string::npos,
+        "DFlash draft horizon must not globally drop to zero just because tool-call grammar is active");
+    ok &= expect(server_context.find("common_sampler_reasoning_is_forcing(smpl.get())") != std::string::npos,
+        "DFlash draft horizon must still hard-stop during deterministic reasoning-budget forcing");
+    ok &= expect(server_context.find("dflash_active_grammar") != std::string::npos,
+        "DFlash server path must track active grammar so flat drafting can continue while tree/rejection shortcuts stay disabled");
+    ok &= expect(server_context.find("const bool grammar_active_for_accept = common_sampler_has_active_grammar(slot.smpl.get());") != std::string::npos,
+        "DFlash flat accept must check active grammar at accept time");
+    ok &= expect(server_context.find("&& !grammar_active_for_accept") != std::string::npos,
+        "DFlash rejection sampling must stay disabled while grammar is active");
+    ok &= expect(server_context.find("!dflash_active_grammar") != std::string::npos,
+        "DFlash tree verification must stay disabled while grammar is active");
+    ok &= expect(server_context.find("!sampling.grammar.empty() && !sampling.grammar_lazy") != std::string::npos,
+        "reduced verifier planning must allow inactive lazy tool grammars before their trigger");
+    ok &= expect(server_context.find("sampling.grammar_lazy || !sampling.grammar_triggers.empty()") == std::string::npos,
+        "reduced verifier planning must not reject every lazy tool-call request before grammar activation");
+    ok &= expect(server_context.find("common_sampler_blocks_speculative(smpl)") != std::string::npos, "DFlash rejection sampling must stop at newly activated grammar/reasoning boundaries");
     ok &= expect(server_context.find("speculative_flat_result_has_bonus") != std::string::npos, "server must distinguish grammar-boundary stops from bonus-token accepts");
     ok &= expect(server_context.find("n_hidden_keep = ids.empty() ? 0 : n_accepted_draft + 1") != std::string::npos, "DFlash ring/tape keep count must include root plus accepted draft tokens");
     ok &= expect(server_context.find("common_speculative_accept(slot.get_spec(), n_accepted_draft)") != std::string::npos, "speculative stats must count accepted draft tokens, not bonus-token-shaped results");

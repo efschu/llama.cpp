@@ -213,6 +213,7 @@ static std::vector<llama_token> speculative_reject_sample(
     const int32_t max_batch_idx = idxs.empty() ? -1 :
         *std::max_element(idxs.begin(), idxs.end());
     log_norm_cache ln_cache(ctx_tgt, temp, max_batch_idx);
+    const bool grammar_active_at_start = common_sampler_has_active_grammar(smpl);
 
     for (size_t i = 0; i < draft.size(); i++) {
         const llama_token target_token = common_sampler_sample(smpl, ctx_tgt, idxs[i]);
@@ -221,7 +222,7 @@ static std::vector<llama_token> speculative_reject_sample(
             common_sampler_accept(smpl, target_token, true);
             result.push_back(target_token);
             n_exact++;
-            if (common_sampler_blocks_speculative(smpl)) {
+            if (common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
                 break;
             }
             continue;
@@ -248,7 +249,7 @@ static std::vector<llama_token> speculative_reject_sample(
             common_sampler_accept(smpl, draft[i], true);
             result.push_back(draft[i]);
             n_prob_accept++;
-            if (common_sampler_blocks_speculative(smpl)) {
+            if (common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
                 break;
             }
         } else {
@@ -259,7 +260,7 @@ static std::vector<llama_token> speculative_reject_sample(
         }
     }
 
-    if (result.size() == draft.size() && !common_sampler_blocks_speculative(smpl)) {
+    if (result.size() == draft.size() && !common_sampler_stops_speculative_accept(smpl, grammar_active_at_start)) {
         const llama_token bonus = common_sampler_sample(smpl, ctx_tgt, idxs[draft.size()]);
         common_sampler_accept(smpl, bonus, true);
         result.push_back(bonus);
@@ -389,7 +390,7 @@ static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(
         plan.reason = "prob-reporting";
         return plan;
     }
-    if (!sampling.grammar.empty() || sampling.grammar_lazy || !sampling.grammar_triggers.empty()) {
+    if (!sampling.grammar.empty() && !sampling.grammar_lazy) {
         plan.reason = "grammar";
         return plan;
     }
@@ -841,7 +842,11 @@ struct server_slot : server_adaptive_dm_state {
             return 0;
         }
 
-        if (common_sampler_blocks_speculative(smpl.get())) {
+        if (global_params.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (common_sampler_reasoning_is_forcing(smpl.get())) {
+                return 0;
+            }
+        } else if (common_sampler_blocks_speculative(smpl.get())) {
             return 0;
         }
 
@@ -4001,9 +4006,12 @@ private:
                     params_base.speculative.branch_budget == 0) {
                 n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max);
             }
+            const bool dflash_active_grammar =
+                params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                slot.smpl && common_sampler_has_active_grammar(slot.smpl.get());
             const bool dflash_sampler_blocks_speculative =
                 params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                slot.smpl && common_sampler_blocks_speculative(slot.smpl.get());
+                slot.smpl && common_sampler_reasoning_is_forcing(slot.smpl.get());
 
             if (n_draft_max > 0 && !dflash_sampler_blocks_speculative) {
                 const int64_t t_draft_slot_start = ggml_time_us();
@@ -4017,6 +4025,7 @@ private:
                 const int original_n_max = params_spec.n_max;
                 params_spec.n_max = std::min(params_spec.n_max, n_draft_max);
                 const bool use_ddtree = params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    !dflash_active_grammar &&
                     params_spec.branch_budget > 0 && batch.n_tokens == 0 && batched_drafts[slot.id].empty();
 
                 if (use_ddtree) {
@@ -5610,9 +5619,11 @@ private:
 
                     auto & prefetched = dflash_flat_accept_prefetches[slot.id];
                     const int64_t t_sample_start = ggml_time_us();
+                    const bool grammar_active_for_accept = common_sampler_has_active_grammar(slot.smpl.get());
                     const bool use_rejection = params_base.speculative.sample_temp > 0.0f
                                             && params_base.sampling.temp > 0.0f
-                                            && !slot.draft_log_probs.empty();
+                                            && !slot.draft_log_probs.empty()
+                                            && !grammar_active_for_accept;
                     if (use_rejection) {
                         prefetched.ids = speculative_reject_sample(slot.smpl.get(), ctx_tgt, slot.spec_draft,
                             slot.spec_i_batch, slot.draft_log_probs, params_base.sampling.temp, slot.reject_rng,
@@ -5810,9 +5821,11 @@ private:
                         capture_indices.push_back(node);
                     }
                 } else {
+                    const bool grammar_active_for_accept = common_sampler_has_active_grammar(slot.smpl.get());
                     const bool use_rejection = params_base.speculative.sample_temp > 0.0f
                                             && params_base.sampling.temp > 0.0f
-                                            && !slot.draft_log_probs.empty();
+                                            && !slot.draft_log_probs.empty()
+                                            && !grammar_active_for_accept;
                     if (use_rejection) {
                         ids = speculative_reject_sample(slot.smpl.get(), ctx_tgt, slot.spec_draft,
                             slot.spec_i_batch, slot.draft_log_probs, params_base.sampling.temp, slot.reject_rng,

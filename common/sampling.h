@@ -68,6 +68,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
 bool common_sampler_supports_reduced(struct common_sampler * gsmpl);
 bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);
+bool common_sampler_has_active_grammar(const struct common_sampler * gsmpl);
+bool common_sampler_reasoning_is_forcing(const struct common_sampler * gsmpl);
+bool common_sampler_stops_speculative_accept(const struct common_sampler * gsmpl, bool grammar_active_at_start);
 
 // generalized version of common_sampler_sample
 //
