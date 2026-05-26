@@ -9764,12 +9764,9 @@ kernel void kernel_set_rows_q32(
     }
 }
 
-// TurboQuant set_rows kernel — block size 128 (QK_TURBO3/QK_TURBO4)
-// TurboQuant SET_ROWS kernel — processes QK_TURBO3_GROUP (128) elements per iteration,
-// writes QK_TURBO3_GROUP/QK_TURBO3 (4) blocks per iteration.
-// The rotation operates on 128 elements, then results are split into 32-element blocks.
-template<typename TI, typename block_q, int QK, void (*quantize_func)(device const float *, device block_q &)>
-kernel void kernel_set_rows_turbo(
+// TurboQuant3 SET_ROWS kernel — processes one 128-element rotation group per iteration.
+template<typename TI>
+kernel void kernel_set_rows_turbo3(
         constant ggml_metal_kargs_set_rows & args,
         device const  void * src0,
         device const  void * src1,
@@ -9787,11 +9784,10 @@ kernel void kernel_set_rows_turbo(
     const int32_t i10 = i01;
     const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
 
-          device block_q * dst_row = (      device block_q *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+          device block_turbo3_0 * dst_row = (      device block_turbo3_0 *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
     const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
-    // Process in groups of 4 blocks (128 elements) for rotation
-    const int blocks_per_group = QK_TURBO3_GROUP / QK;  // 128/32 = 4
+    const int blocks_per_group = QK_TURBO3_GROUP / QK_TURBO3;
     const int n_groups = args.nk0 / blocks_per_group;
 
     for (int grp = tiitg%tptg.x; grp < n_groups; grp += tptg.x) {
@@ -9807,19 +9803,17 @@ kernel void kernel_set_rows_turbo(
         for (int j = 0; j < 128; j++) x[j] = grp_src[j] * inv_norm;
         turbo_rotate_forward(x, turbo_wht_signs1, turbo_wht_signs2);
 
-        // Split into 4 blocks of 32 elements each
-        // All blocks store the SAME group norm — centroids are in normalized space
         for (int b = 0; b < blocks_per_group; b++) {
-            device block_q & blk = dst_row[grp * blocks_per_group + b];
-            const int off = b * QK;
+            device block_turbo3_0 & blk = dst_row[grp * blocks_per_group + b];
+            const int off = b * QK_TURBO3;
 
             blk.norm = half(grp_norm);  // store full 128-element group norm
 
-            for (int j = 0; j < QK / 4; j++) blk.qs[j] = 0;
-            for (int j = 0; j < QK / 8; j++) blk.signs[j] = 0;
+            for (int j = 0; j < QK_TURBO3 / 4; j++) blk.qs[j] = 0;
+            for (int j = 0; j < QK_TURBO3 / 8; j++) blk.signs[j] = 0;
 
             // Quantize rotated values to 3-bit centroids
-            for (int j = 0; j < QK; j++) {
+            for (int j = 0; j < QK_TURBO3; j++) {
                 float rv = x[off + j];  // rotated, normalized value
                 uint8_t idx;
                 if      (rv < turbo_mid_3bit[0]) idx = 0;
@@ -9835,6 +9829,34 @@ kernel void kernel_set_rows_turbo(
                 if (idx & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
             }
         }
+    }
+}
+
+// TurboQuant4 SET_ROWS kernel — one pure 4-bit block per 128-element rotation group.
+template<typename TI>
+kernel void kernel_set_rows_turbo4(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
+    if (i01 >= args.ne01) return;
+
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device block_turbo4_0 * dst_row = (      device block_turbo4_0 *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float          * src_row = (const device float          *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
+        quantize_turbo4_0(src_row + QK_TURBO4*ind, dst_row[ind]);
     }
 }
 
@@ -10680,13 +10702,14 @@ template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
 
-// TurboQuant set_rows instantiations (block size 128)
-typedef decltype(kernel_set_rows_turbo<int64_t, block_turbo3_0, QK_TURBO3, quantize_turbo3_0>) set_rows_turbo_t;
+// TurboQuant set_rows instantiations
+typedef decltype(kernel_set_rows_turbo3<int64_t>) set_rows_turbo3_t;
+typedef decltype(kernel_set_rows_turbo4<int64_t>) set_rows_turbo4_t;
 
-template [[host_name("kernel_set_rows_turbo3_i64")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int64_t, block_turbo3_0, QK_TURBO3, quantize_turbo3_0>;
-template [[host_name("kernel_set_rows_turbo3_i32")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int32_t, block_turbo3_0, QK_TURBO3, quantize_turbo3_0>;
-template [[host_name("kernel_set_rows_turbo4_i64")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int64_t, block_turbo4_0, QK_TURBO4, quantize_turbo4_0>;
-template [[host_name("kernel_set_rows_turbo4_i32")]] kernel set_rows_turbo_t kernel_set_rows_turbo<int32_t, block_turbo4_0, QK_TURBO4, quantize_turbo4_0>;
+template [[host_name("kernel_set_rows_turbo3_i64")]] kernel set_rows_turbo3_t kernel_set_rows_turbo3<int64_t>;
+template [[host_name("kernel_set_rows_turbo3_i32")]] kernel set_rows_turbo3_t kernel_set_rows_turbo3<int32_t>;
+template [[host_name("kernel_set_rows_turbo4_i64")]] kernel set_rows_turbo4_t kernel_set_rows_turbo4<int64_t>;
+template [[host_name("kernel_set_rows_turbo4_i32")]] kernel set_rows_turbo4_t kernel_set_rows_turbo4<int32_t>;
 
 //
 // matrix-matrix multiplication

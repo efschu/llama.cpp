@@ -1020,6 +1020,12 @@ int main(int argc, char ** argv) {
     ok &= expect(metal.find("dst.qs[j / 2] = (idx1 << 4) | idx0") != std::string::npos &&
                  metal.find("turbo_centroids_4bit[idx] * norm") != std::string::npos,
         "Metal Turbo4 must pack two 4-bit indices per byte and dequantize through 4-bit centroids");
+    ok &= expect(metal.find("kernel_set_rows_turbo<int64_t, block_turbo4_0") == std::string::npos &&
+                 metal.find("kernel_set_rows_turbo<int32_t, block_turbo4_0") == std::string::npos,
+        "Metal Turbo4 set_rows must not instantiate the generic signs-based Turbo3 kernel");
+    ok &= expect(metal.find("kernel void kernel_set_rows_turbo4(") != std::string::npos &&
+                 metal.find("typedef decltype(kernel_set_rows_turbo4<int64_t>) set_rows_turbo4_t") != std::string::npos,
+        "Metal Turbo4 set_rows must use a dedicated pure 4-bit kernel");
     ok &= expect(speculative.find("if (common_dflash_debug_logs_enabled())") != std::string::npos &&
                  speculative.find("DFLASH_DBG append_target_hiddens") != std::string::npos,
         "DFlash append-target diagnostics must stay behind the debug logging gate");
