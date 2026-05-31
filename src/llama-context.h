@@ -61,7 +61,7 @@ static inline bool llama_dflash_prefill_plan_needs_staging_for_test(
     return planned_tokens > LLAMA_DFLASH_MAX_VERIFY_TOKENS;
 }
 
-struct llama_memory_recurrent;
+class llama_memory_recurrent;
 
 struct llama_model;
 class llama_batch_allocr;

@@ -1354,7 +1354,7 @@ static void dflash_log_decode_seq_state(
         int32_t pos_max = INT32_MIN;
 
         for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
-            for (uint32_t k = 0; k < ubatch.n_seq_id[t]; ++k) {
+            for (int32_t k = 0; k < ubatch.n_seq_id[t]; ++k) {
                 if (ubatch.seq_id[t][k] != seq) {
                     continue;
                 }
@@ -2649,7 +2649,6 @@ void llama_context::tape_replay(llama_seq_id seq_id, int n_accepted) {
     }
 
     const uint32_t n_embd_s = hparams.n_embd_s();
-    const uint32_t n_embd_r = hparams.n_embd_r();
 
     // find a GPU backend for graph computation
     ggml_backend_t gpu_backend = nullptr;
@@ -6214,7 +6213,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                                 ubatch_pos_max[s] = INT32_MIN;
                             }
                             for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
-                                for (uint32_t k = 0; k < ubatch.n_seq_id[t]; ++k) {
+                                for (int32_t k = 0; k < ubatch.n_seq_id[t]; ++k) {
                                     const llama_seq_id tok_seq = ubatch.seq_id[t][k];
                                     for (int s = 0; s < ns; ++s) {
                                         if (ubatch.seq_id_unq[s] != tok_seq) {
