@@ -20,6 +20,14 @@ static ggml_tensor * make_fattn(
     return ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
 }
 
+static ggml_tensor * make_scale(
+        ggml_context * ctx,
+        ggml_type      type) {
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, type, 128);
+
+    return ggml_scale(ctx, x, 2.0f);
+}
+
 static void test_cpu_rejects_turbo_fattn(ggml_backend_t backend) {
     ggml_init_params params = {
         /* .mem_size   = */ 1024 * 1024,
@@ -62,6 +70,48 @@ static void test_cpu_accepts_f16_fattn(ggml_backend_t backend) {
     ggml_free(ctx);
 }
 
+static void test_cpu_rejects_bf16_scale(ggml_backend_t backend) {
+    ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fail("failed to initialize ggml context");
+    }
+
+    ggml_tensor * scale = make_scale(ctx, GGML_TYPE_BF16);
+    if (ggml_backend_supports_op(backend, scale)) {
+        ggml_free(ctx);
+        fail("CPU backend must reject BF16 scale because the CPU scale kernel only supports F32");
+    }
+
+    ggml_free(ctx);
+}
+
+static void test_cpu_accepts_f32_scale(ggml_backend_t backend) {
+    ggml_init_params params = {
+        /* .mem_size   = */ 1024 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        fail("failed to initialize ggml context");
+    }
+
+    ggml_tensor * scale = make_scale(ctx, GGML_TYPE_F32);
+    if (!ggml_backend_supports_op(backend, scale)) {
+        ggml_free(ctx);
+        fail("CPU backend should support F32 scale");
+    }
+
+    ggml_free(ctx);
+}
+
 int main() {
     ggml_backend_load_all();
 
@@ -72,6 +122,8 @@ int main() {
 
     test_cpu_accepts_f16_fattn(backend);
     test_cpu_rejects_turbo_fattn(backend);
+    test_cpu_accepts_f32_scale(backend);
+    test_cpu_rejects_bf16_scale(backend);
 
     ggml_backend_free(backend);
     return 0;

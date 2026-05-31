@@ -146,6 +146,14 @@ static ggml_tensor * ggml_view_2d_slice(ggml_context * ctx0, ggml_tensor * x, in
                         idx * x->ne[0] * x->ne[1] * ggml_element_size(x));
 }
 
+// Keep the scale op F32: CPU fallback does not implement BF16 scale.
+static ggml_tensor * ggml_bf16_scale_to_f32(ggml_context * ctx0, ggml_tensor * x, float scale) {
+    x = ggml_cast(ctx0, x, GGML_TYPE_F32);
+    x = ggml_scale(ctx0, x, scale);
+    x = ggml_cast(ctx0, x, GGML_TYPE_BF16);
+    return ggml_cast(ctx0, x, GGML_TYPE_F32);
+}
+
 llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_params & params) :
         llm_graph_context(params),
         model(model),
@@ -158,8 +166,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
     // BF16 precision: match training-time BF16 rounding for embedding scale.
     inpL = ggml_cast(ctx0, inpL, GGML_TYPE_BF16);
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))) : 1.0f);
-    inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
+    inpL = ggml_bf16_scale_to_f32(ctx0, inpL, ubatch.token ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf(n_embd))) : 1.0f);
     cb(inpL, "inp_scaled", -1);
 
     // inp_pos - contains the positions
@@ -302,8 +309,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // BF16 precision: match training-time BF16 rounding for router norm+scale.
             ggml_tensor * tmp = ggml_cast(ctx0, attn_out, GGML_TYPE_BF16);
             tmp = ggml_rms_norm(ctx0, tmp, hparams.f_norm_rms_eps);
-            tmp = ggml_scale(ctx0, tmp, 1.0f / ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf((float) n_embd))));
-            tmp = ggml_cast(ctx0, tmp, GGML_TYPE_F32);
+            tmp = ggml_bf16_scale_to_f32(ctx0, tmp, 1.0f / ggml_bf16_to_fp32(ggml_fp32_to_bf16(sqrtf((float) n_embd))));
             tmp = ggml_mul(ctx0, tmp, model.layers[il].ffn_gate_inp_s);
             ggml_tensor * logits = build_lora_mm(model.layers[il].ffn_gate_inp, tmp); // [n_expert, n_tokens]
             cb(logits, "ffn_moe_logits", il);
@@ -536,9 +542,8 @@ ggml_tensor * llama_model_gemma4::graph::build_inp_per_layer() {
         // BF16 precision: match training-time BF16 rounding for per-layer embedding scale.
         inp_per_layer = ggml_cast      (ctx0, inp_per_layer, GGML_TYPE_BF16);
         cb(inp_per_layer, "inp_per_layer_bf16", -1);
-        inp_per_layer = ggml_scale     (ctx0, inp_per_layer, ggml_bf16_to_fp32(ggml_fp32_to_bf16(tok_embd_scale)));
+        inp_per_layer = ggml_bf16_scale_to_f32(ctx0, inp_per_layer, ggml_bf16_to_fp32(ggml_fp32_to_bf16(tok_embd_scale)));
         cb(inp_per_layer, "inp_per_layer_scaled", -1);
-        inp_per_layer = ggml_cast      (ctx0, inp_per_layer, GGML_TYPE_F32);
         cb(inp_per_layer, "inp_per_layer_selected", -1);
 
         res->add_input(std::move(inp));
