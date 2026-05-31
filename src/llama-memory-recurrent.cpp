@@ -185,12 +185,19 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             auto & cell = cells[tail_id];
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
+            // upstream invariant: early return after rollback — skip tail invalidation and cell cleanup
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    LLAMA_LOG_DEBUG("%s: RS-ROLLBACK seq=%d p0=%d cell.pos=%d rollback=%d/%d -> rs_idx=%d, cell.pos=%d\n",
+                                    __func__, seq_id, (int)p0, (int)cell.pos, (int)rollback, (int)n_rs_seq, (int)rollback, (int)(p0 - 1));
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
+                    return true;
                 }
+                LLAMA_LOG_WARN("%s: RS-ROLLBACK-OVERFLOW seq=%d p0=%d cell.pos=%d rollback=%d > n_rs_seq=%d -> CANNOT ROLLBACK\n",
+                               __func__, seq_id, (int)p0, (int)cell.pos, (int)rollback, (int)n_rs_seq);
+                return false;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
@@ -1724,6 +1731,10 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
+            if (idx != 0) {
+                LLAMA_LOG_DEBUG("%s: RS-COPY seq=%d cell=%d idx=%d -> src0=%d (snapshot row %d)\n",
+                                __func__, (int)seq, (int)cell_idx, (int)idx, (int)src0, (int)idx);
+            }
             mem->rs_idx[seq] = 0;
         }
     }

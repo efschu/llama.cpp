@@ -1811,15 +1811,8 @@ private:
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         cparams.type_k   = params_base.speculative.draft.cache_type_k;
         cparams.type_v   = params_base.speculative.draft.cache_type_v;
+        cparams.n_rs_seq = 0;
         return llama_init_from_model(model_tgt, cparams);
-    }
-
-    void mark_mtp_draft_context_seq_rm_supported() {
-        // common_context_can_seq_rm() probes support with a token-only dummy
-        // decode. MTP draft contexts consume target hidden-state/token pairs,
-        // so that probe is not a valid workload for this context type.
-        ctx_dft_seq_rm_type = llama_n_rs_seq(ctx_dft.get()) > 0 ?
-            COMMON_CONTEXT_SEQ_RM_TYPE_RS : COMMON_CONTEXT_SEQ_RM_TYPE_PART;
     }
 
     bool speculative_needs_recurrent_backup_sequences() const {
@@ -1865,7 +1858,11 @@ private:
             return;
         }
 
-        mark_mtp_draft_context_seq_rm_supported();
+        ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+        if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            SRV_WRN("MTP draft context can_seq_rm returned NO after mmproj swap — overriding to FULL, type=%d\n", (int) ctx_dft_seq_rm_type);
+            ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+        }
         params_base.speculative.draft.ctx_tgt = ctx_tgt;
         params_base.speculative.draft.ctx_dft = ctx_dft.get();
 
@@ -2058,9 +2055,7 @@ private:
                     cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
                     cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
                 }
-                if (!has_mtp) {
-                    cparams_dft.n_rs_seq = 0;
-                }
+                cparams_dft.n_rs_seq = 0;
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
@@ -2359,8 +2354,18 @@ private:
                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 cparams.type_k   = params_base.speculative.draft.cache_type_k;
                 cparams.type_v   = params_base.speculative.draft.cache_type_v;
+                cparams.n_rs_seq = 0;
                 ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
-                mark_mtp_draft_context_seq_rm_supported();
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("failed to create MTP draft-model context, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                    SRV_WRN("MTP draft-model context can_seq_rm returned NO — overriding to FULL, type=%d\n", (int) ctx_dft_seq_rm_type);
+                    ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                }
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft.get();
             } else if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
@@ -2372,6 +2377,10 @@ private:
                 }
 
                 ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                    SRV_WRN("draft-model context can_seq_rm returned NO — overriding to FULL, type=%d\n", (int) ctx_dft_seq_rm_type);
+                    ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                }
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft.get();
             }
@@ -2385,7 +2394,12 @@ private:
                 return false;
             }
 
-            mark_mtp_draft_context_seq_rm_supported();
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+
+            if (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                SRV_WRN("MTP draft context can_seq_rm returned NO — overriding to FULL, type=%d\n", (int) ctx_dft_seq_rm_type);
+                ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            }
 
             params_base.speculative.draft.ctx_tgt = ctx_tgt;
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
@@ -4067,7 +4081,6 @@ private:
         server_slot * slot_batched = nullptr;
 
         std::vector<server_slot *> generating;
-        std::vector<server_slot *> drafting;
 
         const int64_t t_cycle_start = ggml_time_us();
         int64_t t_draft_total = 0;
@@ -4206,6 +4219,8 @@ private:
         }
 
         bool ddtree_batch_active = false;
+        std::vector<server_slot *> mtp_drafting;
+        std::vector<server_slot *> mtp_batching; // slots with existing draft that need batch building but not re-drafting
 
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
@@ -4336,139 +4351,166 @@ private:
                     SLT_DBG(slot, "%s", "DDTree draft unavailable, falling back to flat speculative decode\n");
                 }
 
-                llama_tokens draft;
                 const bool use_mtp_spec = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
                     params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH;
-                const llama_pos draft_n_past = use_mtp_spec ? slot.n_pos_before_draft : -1;
+                const llama_pos draft_n_past = use_mtp_spec ? slot.prompt.n_tokens() : -1;
                 if (use_mtp_spec) {
-                    slot.spec_prompt = cached_text_tokens;
-                    common_speculative_get_draft_params(slot.get_spec(), slot.id) = {
-                        /* .drafting = */ true,
-                        /* .n_max    = */ params_spec.n_max,
-                        /* .n_min    = */ params_spec.n_min,
-                        /* .n_past   = */ draft_n_past,
-                        /* .id_last  = */ slot.sampled,
-                        /* .prompt   = */ &slot.spec_prompt,
-                        /* .result   = */ &draft,
-                    };
-                    slot.draft_log_probs.clear();
-                    common_speculative_draft(slot.get_spec());
+                    // MTP: collect draft params only; draft/checkpoint/batch handled in post-loop phases
+                    // (matches upstream's collect-then-draft-then-checkpoint-then-batch pattern)
+                    common_speculative_get_draft_params(slot.get_spec(), slot.id).drafting = false;
+                    if (!slot.spec_draft.empty()) {
+                        // Post-checkpoint-restore: reuse previous (partial) draft.
+                        // Do NOT re-draft (assertion in common_speculative_draft requires
+                        // dp.result->empty() when drafting=true). Just batch-build the
+                        // already-accepted tokens for re-verification against the target.
+                        const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                        if (use_ckpt_tgt) {
+                            GGML_ASSERT(!slot.spec_ckpt.empty());
+                        }
+                        mtp_batching.push_back(&slot);
+                    } else {
+                        GGML_ASSERT(slot.spec_i_batch.empty());
+
+                        slot.spec_ckpt.update_pos(
+                                slot.prompt.n_tokens(),
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+
+                        const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+                        if (use_ckpt_dft) {
+                            slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id,
+                                LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                        }
+
+                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        common_speculative_get_draft_params(slot.get_spec(), slot.id) = {
+                            /* .drafting = */ true,
+                            /* .n_max    = */ n_draft_max,
+                            /* .n_min    = */ params_spec.n_min,
+                            /* .n_past   = */ draft_n_past,
+                            /* .id_last  = */ slot.sampled,
+                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .result   = */ &slot.spec_draft,
+                        };
+                        slot.draft_log_probs.clear();
+                        mtp_drafting.push_back(&slot);
+                    }
                 } else if (!batched_drafts[slot.id].empty()) {
-                    draft = std::move(batched_drafts[slot.id]);
+                    slot.spec_draft = std::move(batched_drafts[slot.id]);
                     slot.draft_log_probs = std::move(batched_log_probs[slot.id]);
                 } else if (use_rejection_sampling) {
                     slot.draft_log_probs.clear();
-                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, &slot.draft_log_probs, draft_n_past);
+                    slot.spec_draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, &slot.draft_log_probs, draft_n_past);
                 } else {
                     slot.draft_log_probs.clear();
-                    draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, draft_n_past);
+                    slot.spec_draft = common_speculative_draft(slot.get_spec(), params_spec, cached_text_tokens, slot.sampled, nullptr, draft_n_past);
                 }
                 slot.spec_pad_i_batch.clear();
 
-                if (draft.size() > (size_t) n_draft_max) {
-                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
-                    draft.resize(n_draft_max);
+                if (slot.spec_draft.size() > (size_t) n_draft_max) {
+                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) slot.spec_draft.size(), n_draft_max);
+                    slot.spec_draft.resize(n_draft_max);
                     if (slot.draft_log_probs.size() > (size_t) n_draft_max) {
                         slot.draft_log_probs.resize(n_draft_max);
                     }
                 }
 
-                if (ctx_dft && use_mtp_spec) {
-                    common_context_seq_rm(ctx_dft.get(), slot.id, slot.n_pos_before_draft, -1);
-                }
+                // MTP batch building is deferred to the post-loop phase below
+                if (!use_mtp_spec) {
+                    slot.spec_i_batch.push_back(batch.n_tokens);
+                    common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                    slot.prompt.tokens.push_back(slot.sampled);
 
-                slot.spec_i_batch.push_back(batch.n_tokens);
-                common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
-                slot.prompt.tokens.push_back(slot.sampled);
-
-                if (draft.empty() || slot.task->params.speculative.n_min > (int) draft.size()) {
-                    if (!draft.empty()) {
-                        SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
-                    }
-                    slot.i_batch = slot.spec_i_batch[0];
-                    slot.spec_draft.clear();
-                    slot.draft_log_probs.clear();
-                    slot.spec_i_batch.clear();
-                    slot.spec_pad_i_batch.clear();
-                } else {
-                    slot.n_draft_total += draft.size();
-
-                    if (needs_reeval) {
-                        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                            const int64_t t_replay_sync_start = dflash_profile_start();
-                            llama_tape_replay_sync(ctx_tgt);
-                            dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
-                            if (params_base.speculative.branch_budget > 0) {
-                                const int n_batch_tokens = 1 + (int) draft.size();
-                                std::vector<int32_t> linear_parents(n_batch_tokens);
-                                linear_parents[0] = -1;
-                                for (int i = 1; i < n_batch_tokens; i++) {
-                                    linear_parents[i] = i - 1;
-                                }
-                                llama_set_tree_parent_ids(ctx_tgt, linear_parents.data(), n_batch_tokens);
-                            }
+                    if (slot.spec_draft.empty() || slot.task->params.speculative.n_min > (int) slot.spec_draft.size()) {
+                        if (!slot.spec_draft.empty()) {
+                            SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) slot.spec_draft.size(), slot.task->params.speculative.n_min);
                         }
+                        slot.i_batch = slot.spec_i_batch[0];
+                        slot.spec_draft.clear();
+                        slot.draft_log_probs.clear();
+                        slot.spec_i_batch.clear();
+                        slot.spec_pad_i_batch.clear();
+                    } else {
+                        slot.n_draft_total += slot.spec_draft.size();
 
-                        // RS contexts handle rollback internally via seq_rm snapshots
-                        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS || use_mtp_spec) {
-                            if (!recurrent_backup_sequences) {
-                                GGML_ABORT("speculative recurrent rollback requires backup sequences when bounded snapshots are unavailable\n");
-                            }
-                            if (!recurrent_expanded) {
-                                if (llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)) {
-                                    SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
-                                } else {
-                                    SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
-                                    GGML_ABORT("failed to expand recurrent state for speculative backup; continuing would corrupt recurrent replay\n");
-                                }
-                                recurrent_expanded = true;
-                            }
-                            const llama_seq_id seq_backup = slot.id + n_parallel_user;
-                            auto * mem = llama_get_memory(ctx_tgt);
-                            llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                        if (needs_reeval) {
                             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
-                                dflash_backup_recurrent_state(slot.id, seq_backup);
-                                slot.has_recurrent_only_backup = true;
-                            } else {
-                                llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
-                                slot.has_recurrent_only_backup = false;
+                                const int64_t t_replay_sync_start = dflash_profile_start();
+                                llama_tape_replay_sync(ctx_tgt);
+                                dflash_profile_add(t_replay_sync_total, t_replay_sync_start);
+                                if (params_base.speculative.branch_budget > 0) {
+                                    const int n_batch_tokens = 1 + (int) slot.spec_draft.size();
+                                    std::vector<int32_t> linear_parents(n_batch_tokens);
+                                    linear_parents[0] = -1;
+                                    for (int i = 1; i < n_batch_tokens; i++) {
+                                        linear_parents[i] = i - 1;
+                                    }
+                                    llama_set_tree_parent_ids(ctx_tgt, linear_parents.data(), n_batch_tokens);
+                                }
                             }
-                            slot.has_draft_backup = true;
-                            slot.seq_id_backup = seq_backup;
-                        }
-                    }
 
-                    for (size_t i = 0; i < draft.size(); i++) {
-                        slot.spec_i_batch.push_back(batch.n_tokens);
-                        common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
-                        slot.prompt.tokens.push_back(draft[i]);
-                    }
-                    const int active_verify_draft_max = n_draft_max;
-                    const common_params_sampling & slot_sampling =
-                        slot.task ? slot.task->params.sampling : params_base.sampling;
-                    if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-                            params_base.speculative.branch_budget == 0 &&
-                            dflash_verify_padding_enabled() &&
-                            !use_rejection_sampling &&
-                            draft.size() < (size_t) active_verify_draft_max &&
-                            common_sampler_supports_reduced(slot.smpl.get()) &&
-                            dflash_select_reduced_verify_plan(slot_sampling, params_base.speculative,
-                                    use_rejection_sampling, false).enabled) {
-                        const int max_pad_draft = std::min<int>(active_verify_draft_max,
-                                std::min<int>((int) llama_n_batch(ctx_tgt) - 1, (int) llama_n_ubatch(ctx_tgt) - 1));
-                        const int max_rows = std::min<int>((int) llama_n_batch(ctx_tgt), (int) llama_n_ubatch(ctx_tgt));
-                        const int rows_available = std::max<int>(0, max_rows - batch.n_tokens);
-                        const int pad_count = std::min<int>(rows_available, std::max<int>(0, max_pad_draft - (int) draft.size()));
-                        const llama_pos pad_pos0 = slot.prompt.tokens.pos_next();
-                        for (int i = 0; i < pad_count; ++i) {
-                            slot.spec_pad_i_batch.push_back(batch.n_tokens);
-                            common_batch_add(batch, slot.sampled, pad_pos0 + i, { slot.id }, true);
+                            // backup sequences are only needed for DFlash on non-RS contexts
+                            // RS contexts handle rollback internally via seq_rm snapshots
+                            // MTP uses the checkpoint-based accept path (which cleans ctx_dft via seq_rm)
+                            if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS && params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                                if (!recurrent_backup_sequences) {
+                                    GGML_ABORT("speculative recurrent rollback requires backup sequences when bounded snapshots are unavailable\n");
+                                }
+                                if (!recurrent_expanded) {
+                                    if (llama_context_recurrent_expand(ctx_tgt, n_seq_max_full)) {
+                                        SRV_INF("expanded recurrent state to %d cells for speculative backup\n", n_seq_max_full);
+                                    } else {
+                                        SRV_ERR("failed to expand recurrent state to %d cells\n", n_seq_max_full);
+                                        GGML_ABORT("failed to expand recurrent state for speculative backup; continuing would corrupt recurrent replay\n");
+                                    }
+                                    recurrent_expanded = true;
+                                }
+                                const llama_seq_id seq_backup = slot.id + n_parallel_user;
+                                auto * mem = llama_get_memory(ctx_tgt);
+                                llama_memory_seq_rm(mem, seq_backup, -1, -1);
+                                if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
+                                    dflash_backup_recurrent_state(slot.id, seq_backup);
+                                    slot.has_recurrent_only_backup = true;
+                                } else {
+                                    llama_memory_seq_cp(mem, slot.id, seq_backup, -1, -1);
+                                    slot.has_recurrent_only_backup = false;
+                                }
+                                slot.has_draft_backup = true;
+                                slot.seq_id_backup = seq_backup;
+                            }
                         }
-                        if (pad_count > 0) {
-                            SLT_DBG(slot, "padded DFlash verifier batch by %d tokens to active graph shape (GGML_DFLASH_VERIFY_PAD=1)\n", pad_count);
+
+                        for (size_t i = 0; i < slot.spec_draft.size(); i++) {
+                            slot.spec_i_batch.push_back(batch.n_tokens);
+                            common_batch_add(batch, slot.spec_draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
+                            slot.prompt.tokens.push_back(slot.spec_draft[i]);
+                        }
+                        const int active_verify_draft_max = n_draft_max;
+                        const common_params_sampling & slot_sampling =
+                            slot.task ? slot.task->params.sampling : params_base.sampling;
+                        if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                                params_base.speculative.branch_budget == 0 &&
+                                dflash_verify_padding_enabled() &&
+                                !use_rejection_sampling &&
+                                slot.spec_draft.size() < (size_t) active_verify_draft_max &&
+                                common_sampler_supports_reduced(slot.smpl.get()) &&
+                                dflash_select_reduced_verify_plan(slot_sampling, params_base.speculative,
+                                        use_rejection_sampling, false).enabled) {
+                            const int max_pad_draft = std::min<int>(active_verify_draft_max,
+                                    std::min<int>((int) llama_n_batch(ctx_tgt) - 1, (int) llama_n_ubatch(ctx_tgt) - 1));
+                            const int max_rows = std::min<int>((int) llama_n_batch(ctx_tgt), (int) llama_n_ubatch(ctx_tgt));
+                            const int rows_available = std::max<int>(0, max_rows - batch.n_tokens);
+                            const int pad_count = std::min<int>(rows_available, std::max<int>(0, max_pad_draft - (int) slot.spec_draft.size()));
+                            const llama_pos pad_pos0 = slot.prompt.tokens.pos_next();
+                            for (int i = 0; i < pad_count; ++i) {
+                                slot.spec_pad_i_batch.push_back(batch.n_tokens);
+                                common_batch_add(batch, slot.sampled, pad_pos0 + i, { slot.id }, true);
+                            }
+                            if (pad_count > 0) {
+                                SLT_DBG(slot, "padded DFlash verifier batch by %d tokens to active graph shape (GGML_DFLASH_VERIFY_PAD=1)\n", pad_count);
+                            }
                         }
                     }
-                    slot.spec_draft = std::move(draft);
                 }
                 t_draft_total += ggml_time_us() - t_draft_slot_start;
                 n_slots_drafted++;
@@ -4489,6 +4531,71 @@ private:
                 SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                         slot.n_ctx, slot.prompt.n_tokens(), slot.truncated);
             }
+        }
+
+        // --- MTP post-loop phases (upstream-aligned) ---
+        // Phase 2: single draft call for all collected MTP slots
+        if (!mtp_drafting.empty()) {
+            common_speculative_draft(spec.get());
+        }
+
+        // Phase 3: checkpoint creation and batch building for MTP slots
+        for (auto * slot_ptr : mtp_drafting) {
+            auto & slot = *slot_ptr;
+
+            auto & draft = slot.spec_draft;
+            auto & ckpt  = slot.spec_ckpt;
+
+            slot.n_draft_total += draft.size();
+
+            // checkpoint: load dft state and seq_rm past checkpoint
+            const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+
+            if (ctx_dft) {
+                if (use_ckpt_dft) {
+                    ckpt.load_dft(ctx_dft.get(), slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                }
+                common_context_seq_rm(ctx_dft.get(), slot.id, ckpt.pos_max + 1, -1);
+            }
+
+            if (!draft.empty()) {
+                const bool use_ckpt_tgt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                   (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
+
+                const bool use_ckpt_dft_rs =
+                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
+
+                if (use_ckpt_tgt) {
+                    ckpt.update_tgt(ctx_tgt, slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                }
+
+                if (use_ckpt_dft_rs) {
+                    ckpt.update_dft(ctx_dft.get(), slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+                }
+            }
+
+            if (slot.spec_draft.empty() || slot.task->params.speculative.n_min > (int) slot.spec_draft.size()) {
+                if (!slot.spec_draft.empty()) {
+                    SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) slot.spec_draft.size(), slot.task->params.speculative.n_min);
+                }
+                slot.spec_draft.clear();
+                slot.draft_log_probs.clear();
+                slot.spec_pad_i_batch.clear();
+            }
+
+            slot.update_batch(batch);
+        }
+
+        // Phase 3b: batch building only for post-restore MTP slots (no re-drafting)
+        for (auto * slot_ptr : mtp_batching) {
+            auto & slot = *slot_ptr;
+
+            slot.n_draft_total += slot.spec_draft.size();
+            slot.update_batch(batch);
         }
 
         // process in chunks of params.n_batch
@@ -5723,7 +5830,7 @@ private:
                             }
                         }
                         if (begin_speculative_state) {
-                            common_speculative_begin(slot.get_spec(), slot.prompt.tokens.get_text_tokens());
+                            common_speculative_begin(slot.get_spec(), slot.id, slot.prompt.tokens.get_text_tokens());
                         }
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
@@ -5933,6 +6040,128 @@ private:
                     dst += now - profile_accept_phase_start;
                     profile_accept_phase_start = now;
                 };
+
+                // MTP-only speculative accept — hard-isolated upstream lifecycle
+                // Upstream contract: sample_and_accept_n() → n_rollback → on rollback
+                // ckpt-restore+continue (skip accept), on commit accept+insert[0..N-2]+sampled=N-1.
+                // This block replaces the DFlash-era generic accept path for MTP because
+                // that path has speculative_has_bonus/n_prompt_insert bugs and calls
+                // common_speculative_accept() before the rollback decision.
+                const bool use_mtp_spec_accept =
+                    params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                    params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    !is_draft_tree;
+
+                if (use_mtp_spec_accept) {
+                    GGML_ASSERT(n_draft > 0);
+                    GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
+                    common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+
+                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                    slot.spec_i_batch.clear();
+
+                    GGML_ASSERT(accepted.size() >= 1);
+
+                    const uint16_t n_accepted_draft = (uint16_t) (accepted.size() - 1);
+                    const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+
+                    const bool use_ckpt_tgt =
+                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                       (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+
+                    // check for partial draft acceptance
+                    if (n_rollback > 0) {
+                        if (use_ckpt_tgt) {
+                            SLT_INF(slot, "accepted %2d/%2zu draft tokens (restore checkpoint)\n", n_accepted_draft, slot.spec_draft.size());
+
+                            // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                            slot.spec_draft = std::move(accepted);
+
+                            const auto & ckpt = slot.spec_ckpt;
+
+                            SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+
+                            {
+                                ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+                                common_context_seq_rm(slot.ctx_tgt, slot.id, ckpt.pos_max + 1, -1);
+                            }
+
+                            if (slot.ctx_dft) {
+                                ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+
+                                common_context_seq_rm(slot.ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                            }
+
+                            slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                            slot.smpl = std::move(smpl_save);
+
+                            continue;
+                        }
+                    }
+
+                    SLT_INF(slot, "accepted %2d/%2zu draft tokens\n", n_accepted_draft, n_draft);
+
+                    common_speculative_accept(slot.get_spec(), slot.id, n_accepted_draft);
+
+                    slot.spec_draft = std::move(accepted);
+
+                    const int64_t t_current = ggml_time_us();
+
+                    const auto ids = std::move(slot.spec_draft);
+
+                    slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+
+                    // update how many tokens out of those tested were accepted
+                    slot.n_draft_accepted += ids.size() - 1;
+
+                    if (slot.dm_adaptive) {
+                        slot.observe_profit_acceptance((int) n_draft, (int) ids.size() - 1);
+                        slot.profit_pending = true;
+                        slot.profit_pending_n_draft = (int32_t) n_draft;
+                        slot.profit_pending_n_accepted = (int32_t) ids.size() - 1;
+                        slot.profit_pending_tree = false;
+                    }
+
+                    // add accepted tokens to the prompt
+                    slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);
+                    slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
+
+                    slot.sampled = ids.back(); // last accepted token
+                    SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
+
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    if (slot.ctx_dft) {
+                        common_context_seq_rm(slot.ctx_dft, slot.id, slot.prompt.tokens.pos_next(), -1);
+                    }
+
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        completion_token_output result;
+
+                        result.tok          = ids[i];
+                        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+                        result.prob         = 1.0f; // set later
+
+                        // TODO: set result.probs
+
+                        slot.n_decoded += 1;
+
+                        if (!process_token(result, slot)) {
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+
+                            break;
+                        }
+                    }
+
+                    slot.print_timings_tg();
+
+                    SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+                    continue;
+                }
 
                 llama_tokens ids;
                 int  tree_commit_n = 0;
@@ -6239,11 +6468,9 @@ private:
                     }
                 }
 
-                const bool use_mtp_spec = params_base.speculative.has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
-                    params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH;
-                if (use_mtp_spec) {
-                    common_speculative_accept(slot.get_spec(), slot.id, n_accepted_draft);
-                } else {
+                // Plain MTP is handled by the dedicated block above (use_mtp_spec_accept).
+                // This path is only reached for DFlash, tree, or other speculative types.
+                {
                     common_speculative_accept(slot.get_spec(), n_accepted_draft);
                 }
 
@@ -6378,9 +6605,10 @@ private:
                     slot.has_recurrent_only_backup = false;
                     slot.seq_id_backup = -1;
                 } else {
-                    llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, slot.prompt.tokens.pos_next(), -1);
-                    if (ctx_dft && use_mtp_spec) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, slot.prompt.tokens.pos_next(), -1);
+                    const llama_pos pos_next_d = slot.prompt.tokens.pos_next();
+                    common_context_seq_rm(ctx_tgt, slot.id, pos_next_d, -1);
+                    if (ctx_dft) {
+                        common_context_seq_rm(ctx_dft.get(), slot.id, pos_next_d, -1);
                     }
                     if (is_draft_tree) {
                         llama_clear_tree_parent_ids(ctx_tgt);

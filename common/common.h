@@ -492,10 +492,11 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
-        if (has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) && type() != COMMON_SPECULATIVE_TYPE_DFLASH) {
-            return 0u;
-        }
-        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) ? draft.n_max : 0u;
+        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        });
+
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 

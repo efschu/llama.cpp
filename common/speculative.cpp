@@ -662,7 +662,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
-    std::vector<llama_pos> verify_h_pos_beg;
 
     // Per-seq draft length from the last draft() call, used in accept() to
     // roll back ctx_dft's recurrent state past the AR draft's redundant
@@ -730,7 +729,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
-        verify_h_pos_beg.assign(n_seq, -1);
 
         last_n_drafted.assign(n_seq, 0);
     }
@@ -768,32 +766,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "(need_embd / logits=1 on every prompt position?). "
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
-        }
-        align_to_past(seq_id, N, "begin");
-    }
-
-    void align_to_past(llama_seq_id seq_id, llama_pos n_past, const char * reason) {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || n_past <= 0) {
-            return;
-        }
-
-        auto * ctx_dft = this->params.ctx_dft;
-        auto * mem_dft = llama_get_memory(ctx_dft);
-        const llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, seq_id);
-        if (pos_max >= n_past) {
-            llama_memory_seq_rm(mem_dft, seq_id, n_past, -1);
-        }
-
-        const int32_t n_rows = verify_h_rows[seq_id];
-        const llama_pos pos_beg = verify_h_pos_beg[seq_id];
-        const llama_pos wanted = n_past - 1;
-        const llama_pos idx = wanted - pos_beg;
-        if (pos_beg >= 0 && idx >= 0 && idx < n_rows) {
-            const size_t row_bytes = (size_t) n_embd * sizeof(float);
-            std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) idx * n_embd, row_bytes);
-        } else if (pos_max >= n_past) {
-            LOG_WRN("%s: could not align pending_h during %s for seq_id=%d n_past=%d (last verify pos=%d rows=%d)\n",
-                    __func__, reason, (int) seq_id, (int) n_past, (int) pos_beg, n_rows);
         }
     }
 
@@ -850,14 +822,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
             std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
 
-            //{
-            //    // string with seq_ids in the batch
-            //    std::stringstream ss;
-            //    for (int i = 0; i < n_tokens; ++i) {
-            //        ss << batch_in.seq_id[i][0] << ",";
-            //    }
-            //    LOG_WRN("%s: batch_in.seq_id = %s\n", __func__, ss.str().c_str());
-            //}
         }
 
         // fill the pending embeddings from a previous run
@@ -886,7 +850,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
-            verify_h_pos_beg[seq_id] = batch_in.pos[i_batch_beg[seq_id]];
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -924,8 +887,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (!dp.drafting) {
                 continue;
             }
-
-            align_to_past(seq_id, dp.n_past, "draft");
 
             n_drafting++;
             drafting[seq_id] = true;
@@ -970,12 +931,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
 
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
@@ -2309,8 +2264,10 @@ struct common_speculative_impl_dflash : public common_speculative_impl {
 
     // build interleaved cross-attention data from ring buffer (GPU or CPU path)
     int build_cross_data(llama_context * ctx) {
-        LOG_DBG("DFLASH_DBG build_cross_data: ring_write_pos=%d ring_filled=%d committed_len=%d cross_ctx=%d gpu=%d\n",
-            ring_write_pos, ring_filled, committed_len, cross_ctx, gpu_ring_handle ? 1 : 0);
+        if (common_dflash_debug_logs_enabled()) {
+            LOG_DBG("DFLASH_DBG build_cross_data: ring_write_pos=%d ring_filled=%d committed_len=%d cross_ctx=%d gpu=%d\n",
+                ring_write_pos, ring_filled, committed_len, cross_ctx, gpu_ring_handle ? 1 : 0);
+        }
         if (!common_dflash_target_capture_ready_or_skip(ctx_tgt)) {
             return -1;
         }

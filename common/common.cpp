@@ -1448,6 +1448,10 @@ std::string common_get_model_endpoint() {
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    if (ctx == nullptr) {
+        return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    }
+
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
