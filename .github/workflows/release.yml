@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 env:
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
@@ -102,6 +102,10 @@ jobs:
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
 
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
@@ -155,6 +159,10 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Pack artifacts
         run: |
@@ -212,6 +220,10 @@ jobs:
             -DLLAMA_FATAL_WARNINGS=ON \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Pack artifacts
         run: |
@@ -295,6 +307,10 @@ jobs:
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j "$(nproc)"
 
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
+
       - name: Pack artifacts
         run: |
           rocm_short="$(echo "${ROCM_VERSION}" | cut -d '.' -f 1,2)"
@@ -349,6 +365,10 @@ jobs:
             -DGGML_OPENMP=ON ^
             %CMAKE_ARGS%
           cmake --build build --config Release
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Pack artifacts
         shell: pwsh
@@ -417,6 +437,10 @@ jobs:
             -DGGML_CUDA_CUB_3DOT2=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Pack CUDA backend
         run: 7z a -snl "beellama-bin-win-cuda-${{ matrix.cuda }}-x64.zip" .\build\bin\Release\ggml-cuda.dll
@@ -533,6 +557,10 @@ jobs:
           Copy-Item "${env:HIP_PATH}\bin\rocblas.dll" "build\bin\"
           Copy-Item "${env:HIP_PATH}\bin\rocblas\library\*" "build\bin\rocblas\library\"
           Copy-Item "${env:HIP_PATH}\bin\hipblaslt\library\*" "build\bin\hipblaslt\library\"
+
+      - name: ccache stats
+        if: always()
+        run: ccache --show-stats
 
       - name: Pack artifacts
         run: 7z a -snl "beellama-bin-win-hip-radeon-x64.zip" .\build\bin\*
