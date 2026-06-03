@@ -1879,6 +1879,7 @@ private:
     int trace = 0;
     int slots_debug = 0;
     int n_empty_consecutive = 0;
+    int dflash_next_tg_slot = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -4421,16 +4422,64 @@ private:
         std::vector<llama_tokens> batched_drafts(slots.size());
         std::vector<std::vector<float>> batched_log_probs(slots.size());
         const bool use_rejection_sampling = params_base.speculative.sample_temp > 0.0f && params_base.sampling.temp > 0.0f;
-        const bool dflash_recurrent_has_pending_prompt =
+        int dflash_tg_batch_rows = -1;
+        auto dflash_multi_seq_tg_rows_safe = [](int rows) {
+            return rows == 1;
+        };
+        auto dflash_try_reserve_tg_rows = [&](const server_slot & slot, int rows) {
+            if (params_base.speculative.type() != COMMON_SPECULATIVE_TYPE_DFLASH ||
+                    params_base.speculative.branch_budget != 0 ||
+                    rows <= 0) {
+                return true;
+            }
+
+            if (batch.n_tokens == 0 || dflash_tg_batch_rows < 0) {
+                dflash_tg_batch_rows = rows;
+                return true;
+            }
+
+            if (dflash_tg_batch_rows == rows && dflash_multi_seq_tg_rows_safe(rows)) {
+                return true;
+            }
+
+            if (dflash_server_crash_trace_enabled()) {
+                SLT_INF(slot, "dflash uneven TG rows deferred: reason=%s batch_rows=%d slot_rows=%d batch_tokens=%d\n",
+                        dflash_tg_batch_rows == rows ? "multi-row" : "uneven",
+                        dflash_tg_batch_rows, rows, batch.n_tokens);
+            }
+            return false;
+        };
+        auto dflash_skip_tg_slot_for_next_cycle = [](server_slot & slot) {
+            slot.spec_i_batch.clear();
+            slot.spec_pad_i_batch.clear();
+            slot.spec_draft.clear();
+            slot.draft_log_probs.clear();
+        };
+        const bool dflash_has_pending_prompt =
             params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
-            needs_reeval &&
             std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
-                return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                return slot.can_speculate() &&
+                    (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
             });
+        const bool dflash_has_profit_baseline_slot =
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            params_base.speculative.branch_budget == 0 &&
+            std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.state == SLOT_STATE_GENERATING &&
+                    slot.can_speculate() &&
+                    slot.dm_adaptive &&
+                    server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
+                    (slot.profit_baseline_probe_pending ||
+                        !slot.profit_baseline_ready() ||
+                        slot.adaptive_n_max < 0);
+            });
+        const bool dflash_force_profit_baseline_cycle =
+            dflash_has_profit_baseline_slot && !dflash_has_pending_prompt;
         std::vector<int> dflash_cohort_n_draft_max(slots.size(), -1);
         if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                 params_base.speculative.branch_budget == 0 &&
-                !dflash_recurrent_has_pending_prompt) {
+                !dflash_has_pending_prompt &&
+                !dflash_force_profit_baseline_cycle) {
             std::vector<int> normal_n_max(slots.size(), 0);
             std::vector<int> cohort_cap_n_max(slots.size(), 0);
 
@@ -4474,7 +4523,8 @@ private:
                 if (slot.state == SLOT_STATE_GENERATING &&
                         slot.can_speculate() &&
                         dflash_scheduler_n_draft_max(slot, false) > 0 &&
-                        !dflash_recurrent_has_pending_prompt) {
+                        !dflash_has_pending_prompt &&
+                        !dflash_force_profit_baseline_cycle) {
                     n_drafting++;
                 }
             }
@@ -4491,7 +4541,8 @@ private:
                     if (slot.state == SLOT_STATE_GENERATING &&
                             slot.can_speculate() &&
                             dflash_scheduler_n_draft_max(slot, false) > 0 &&
-                            !dflash_recurrent_has_pending_prompt) {
+                            !dflash_has_pending_prompt &&
+                            !dflash_force_profit_baseline_cycle) {
                         batch_specs.push_back(slot.get_spec());
                         batch_id_lasts.push_back(slot.sampled);
                         batch_slot_ids.push_back(slot.id);
@@ -4531,14 +4582,26 @@ private:
         bool ddtree_batch_active = false;
         std::vector<server_slot *> mtp_drafting;
         std::vector<server_slot *> mtp_batching; // slots with existing draft that need batch building but not re-drafting
+        const bool dflash_rotate_tg_slots =
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            params_base.speculative.branch_budget == 0 &&
+            !slots.empty();
+        const int dflash_tg_slot_start = dflash_rotate_tg_slots
+            ? std::clamp(dflash_next_tg_slot, 0, (int) slots.size() - 1)
+            : 0;
 
         // first, add sampled tokens from any ongoing sequences
-        for (auto & slot : slots) {
+        for (int slot_offset = 0; slot_offset < (int) slots.size(); ++slot_offset) {
+            const int slot_index = dflash_rotate_tg_slots
+                ? (dflash_tg_slot_start + slot_offset) % (int) slots.size()
+                : slot_offset;
+            auto & slot = slots[slot_index];
+
             if (slot.state != SLOT_STATE_GENERATING) {
                 continue;
             }
 
-            if (dflash_recurrent_has_pending_prompt && slot.can_speculate()) {
+            if (dflash_has_pending_prompt && slot.can_speculate()) {
                 continue;
             }
 
@@ -4553,6 +4616,9 @@ private:
             if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
                     params_base.speculative.branch_budget == 0) {
                 n_draft_max = dflash_flat_effective_draft_max(ctx_dft_shared.get(), n_draft_max);
+            }
+            if (dflash_force_profit_baseline_cycle && n_draft_max > 0) {
+                n_draft_max = 0;
             }
             const bool dflash_active_grammar =
                 params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
@@ -4730,11 +4796,20 @@ private:
 
                 // MTP batch building is deferred to the post-loop phase below
                 if (!use_mtp_spec) {
+                    const bool small_draft =
+                        slot.spec_draft.empty() ||
+                        slot.task->params.speculative.n_min > (int) slot.spec_draft.size();
+                    const int dflash_slot_tg_rows = small_draft ? 1 : 1 + (int) slot.spec_draft.size();
+                    if (!dflash_try_reserve_tg_rows(slot, dflash_slot_tg_rows)) {
+                        dflash_skip_tg_slot_for_next_cycle(slot);
+                        continue;
+                    }
+
                     slot.spec_i_batch.push_back(batch.n_tokens);
                     common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                     slot.prompt.tokens.push_back(slot.sampled);
 
-                    if (slot.spec_draft.empty() || slot.task->params.speculative.n_min > (int) slot.spec_draft.size()) {
+                    if (small_draft) {
                         if (!slot.spec_draft.empty()) {
                             SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) slot.spec_draft.size(), slot.task->params.speculative.n_min);
                         }
@@ -4828,6 +4903,11 @@ private:
                 t_draft_total += ggml_time_us() - t_draft_slot_start;
                 n_slots_drafted++;
             } else {
+                if (!dflash_try_reserve_tg_rows(slot, 1)) {
+                    dflash_skip_tg_slot_for_next_cycle(slot);
+                    continue;
+                }
+
                 if (slot.can_speculate() && slot.dm_adaptive &&
                         server_adaptive_dm_uses_profit_controller(slot.dm_controller) &&
                         slot.profit_expects_baseline_sample()) {
@@ -4920,12 +5000,15 @@ private:
         // track how many TG tokens are in the batch vs total, to detect
         // pure-verify batches where multi-seq batching is safe.
         const int32_t n_tg_tokens = batch.n_tokens;
+        const bool dflash_batch_has_tg =
+            params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+            n_tg_tokens > 0;
 
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (!ddtree_batch_active && (params_base.cont_batching || batch.n_tokens == 0)) {
+        if (!ddtree_batch_active && !dflash_batch_has_tg && (params_base.cont_batching || batch.n_tokens == 0)) {
             for (auto & slot : slots) {
                 if (!slot.is_processing()) {
                     continue;
@@ -7142,6 +7225,13 @@ private:
         if (n_slots_drafted > 0) {
             const int64_t t_cycle_total = ggml_time_us() - t_cycle_start;
             const int64_t t_other = t_cycle_total - t_draft_total - t_verify_total - t_accept_total;
+            if (params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&
+                    params_base.speculative.branch_budget == 0 &&
+                    dflash_cycle_slot &&
+                    dflash_cycle_slot->id >= 0 &&
+                    !slots.empty()) {
+                dflash_next_tg_slot = (dflash_cycle_slot->id + 1) % (int) slots.size();
+            }
             if (profile_dflash_cycle && n_slots_drafted == 1 && dflash_cycle_slot &&
                     params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH) {
                 const common_dflash_ring_stats ring_stats =

@@ -1766,6 +1766,27 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("dflash_multiseq_rows") != std::string::npos &&
                  server_context.find("uneven-rows") != std::string::npos,
         "server must not multi-seq batch DFlash target views with uneven per-slot rows because GPU hidden capture is per-ubatch");
+    ok &= expect(server_context.find("dflash_batch_has_tg") != std::string::npos &&
+                 server_context.find("!dflash_batch_has_tg && (params_base.cont_batching || batch.n_tokens == 0)") != std::string::npos,
+        "server must defer prompt batching when the current DFlash batch already contains TG verifier rows");
+    ok &= expect(server_context.find("dflash_try_reserve_tg_rows") != std::string::npos &&
+                 server_context.find("dflash_skip_tg_slot_for_next_cycle") != std::string::npos &&
+                 server_context.find("dflash uneven TG rows deferred") != std::string::npos,
+        "server must defer uneven DFlash TG slots instead of decoding a combined view with partial hidden capture");
+    ok &= expect(server_context.find("dflash_multi_seq_tg_rows_safe") != std::string::npos &&
+                 server_context.find("rows == 1") != std::string::npos,
+        "server must only multi-seq batch DFlash target verification when each slot contributes one row");
+    ok &= expect(server_context.find("dflash_next_tg_slot") != std::string::npos &&
+                 server_context.find("dflash_tg_slot_start") != std::string::npos,
+        "server must fairly rotate one-slot DFlash multi-row verifier cycles instead of always starting at slot 0");
+    ok &= expect(server_context.find("dflash_has_pending_prompt") != std::string::npos &&
+                 server_context.find("dflash_has_pending_prompt && slot.can_speculate()") != std::string::npos &&
+                 server_context.find("params_base.speculative.type() == COMMON_SPECULATIVE_TYPE_DFLASH &&\n            needs_reeval &&\n            std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {\n                return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;\n            })") == std::string::npos,
+        "DFlash must prioritize unfinished prompt prefill before TG rows on all target types, not only recurrent/hybrid targets");
+    ok &= expect(server_context.find("dflash_has_profit_baseline_slot") != std::string::npos &&
+                 server_context.find("dflash_force_profit_baseline_cycle") != std::string::npos &&
+                 server_context.find("dflash_force_profit_baseline_cycle && n_draft_max > 0") != std::string::npos,
+        "DFlash adaptive profit baseline slots must get one-row target cycles instead of starving behind multi-row verifier batches");
     ok &= expect(common_h.find("int32_t dflash_max_slots = 0") != std::string::npos &&
                  server_context.find("params_base.speculative.dflash_max_slots > 0") != std::string::npos &&
                  server_context.find("DFlash enabled for all %d slots") != std::string::npos,
@@ -1786,7 +1807,7 @@ int main(int argc, char ** argv) {
     ok &= expect(server_context.find("dflash_multislot_flat_accept_barrier") != std::string::npos &&
                  server_context.find("struct dflash_flat_accept_prefetch") != std::string::npos &&
                  server_context.find("common_speculative_update_logits_deferred_dflash_kv(slot.get_spec(), ctx_tgt, batch_tokens, prefetched.n_hidden_keep);") != std::string::npos &&
-                 server_context.find("dflash_recurrent_has_pending_prompt") != std::string::npos &&
+                 server_context.find("dflash_has_pending_prompt") != std::string::npos &&
                  server_context.find("dflash_recurrent_draft_rr") == std::string::npos &&
                  server_context.find("dflash_recurrent_cycle_slot_id") == std::string::npos,
         "DFlash recurrent/hybrid multi-slot scheduling must isolate prompt prefill, pre-sample every flat speculative slot before rollback, and remove the old one-slot recurrent round-robin");
