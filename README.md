@@ -2,7 +2,7 @@
 
 ![BeeLlama.cpp logo](beellama.jpg)
 
-BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It keeps the familiar llama.cpp tools and server flow, then adds DFlash speculative decoding, adaptive draft control, TurboQuant/TCQ KV-cache compression, Tom TQ3/TQ4 weight formats, and reasoning-loop protection, with full multimodal support.
+BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It keeps the familiar llama.cpp tools and server flow, then adds DFlash speculative decoding, adaptive draft control, TurboQuant/TCQ KV-cache compression, and reasoning-loop protection, with full multimodal support.
 
 > Not quite a pegasus, but close enough.
 
@@ -18,7 +18,7 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **DFlash speculative decoding**: `--spec-type dflash` drives a DFlash draft GGUF alongside the target model. The target captures hidden states into a ring buffer, the drafter cross-attends to the most recent `--spec-dflash-cross-ctx` hidden-state tokens and proposes drafts for target verification.
 - **Adaptive draft-max control**: The server adjusts the active draft horizon at runtime instead of using a fixed `--spec-draft-n-max`. The default `profit` controller compares speculative throughput against a no-spec baseline, the `fringe` alternative maps acceptance-rate bands to draft depth.
 - **Full multimodal support**: When `--mmproj` is active, the server keeps DFlash available for text generation. The model can be fully offloaded to CPU with no problems to reduce VRAM pressure.
-- **Up to date with upstream llama.cpp** — MTP speculative decoding, parallel drafting, the unified llama app, updated server/API behavior, backend improvements across CUDA, HIP, Metal, Vulkan, and more.
+- **Up to date with upstream llama.cpp**: MTP speculative decoding, parallel drafting, the unified llama app, updated server/API behavior, backend improvements across CUDA, HIP, Metal, Vulkan, and more.
 - **TurboQuant / TCQ KV-cache compression**: Five cache types (`turbo2`, `turbo3`, `turbo4`, `turbo2_tcq`, `turbo3_tcq`) spanning from 4x to 7.5x compression, with TCQ types offering good precision for their size. Set independently with `--cache-type-k` and `--cache-type-v`.
 - **Tom TQ3/TQ4 model weight formats**: `TQ3_1S` and `TQ4_1S` are available through `llama-quantize` with non-conflicting GGML type IDs `47` and `48`. These are GGUF weight formats, not KV-cache types; backend acceleration should be validated before claiming it for a deployment.
 - **Reasoning-loop protection**: The server detects repeated hidden reasoning output and intervenes. Default mode is `force-close`, with `--reasoning-loop-window` and `--reasoning-loop-max-period` tuning available.
@@ -264,16 +264,18 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 | K / V | % of bf16 size | 99.9% precision | What it is for |
 | --- | ---: | ---: | --- |
 | bf16 / bf16 | 100 | 100.0% | Preserving full quality |
-| q8_0 / q8_0 | 53.1 | 94.6% | Compression with minimal losses |
-| **q8_0 / q5_1** | **45.3** | **94.2%** | **Great precision/size at high end** |
-| q8_0 / q5_0 | 43.8 | 93.7% | If q8_0 / q5_1 doesn't fit just a bit |
-| q5_0 / q5_0 | 34.4 | 92.7% | Good precision/size, relatively safe |
+| q8_0 / q8_0 | 53.1 | 94.6% | Validation and blame-isolation mode |
+| **q8_0 / q6_0** | **46.9** | **94.3%** | **Recommended high-end preset** |
+| q8_0 / q5_1 | 45.3 | 94.2% | Fallback if q6_0 V is unavailable |
+| q8_0 / q5_0 | 43.8 | 93.7% | If the high-end rows miss the fit by a narrow margin |
+| q6_0 / q5_0 | 37.5 | 93.3% | Optional headroom tier between q5 and q8 K |
+| q5_0 / q5_0 | 34.4 | 93.2% | Normal quality preset |
 | **q5_0 / q4_1** | **32.8** | **92.6%** | **Best default if VRAM-constrained** |
-| q5_0 / q4_0 | 31.3 | 91.4% | If q5_0 / q4_1 doesn't fit just a bit |
-| q4_0 / q4_0 | 28.1 | 89.8% | Memory saving with precision loss |
-| q4_0 / turbo3_tcq | 24.2 | 84.9% | Smaller than q4, cleaner than turbo3_tcq |
-| **turbo3_tcq / turbo3_tcq** | **20.3** | **81.6%** | **Viable as extreme compression** |
-| turbo2_tcq / turbo2_tcq | 14.1 | 54.4% | Last resort: not for code and tool calls |
+| q5_0 / q4_0 | 31.3 | 91.4% | If q5_0 / q4_1 misses the fit by a narrow margin |
+| q4_0 / q4_0 | 28.1 | 88.9% | Memory saving with visible precision loss |
+| q4_0 / turbo3_tcq | 24.2 | 84.9% | Smaller than q4, cleaner than symmetric turbo3_tcq |
+| **turbo3_tcq / turbo3_tcq** | **20.3** | **81.6%** | **Viable extreme-compression mode** |
+| turbo2_tcq / turbo2_tcq | 14.1 | 54.4% | Last resort: not for code, JSON, math, or tool calls |
 
 *99.9% precision = `100 · exp(−(quantKLD − bf16KLD))` at the 99.9% KL-divergence tail.*
 
@@ -282,6 +284,7 @@ K and V cache types are set independently with `--cache-type-k` and `--cache-typ
 | Type | Origin | bpv | Diff vs bf16 | Notes |
 | --- | --- | ---: | ---: | --- |
 | q8_0 | upstream | 8.5 | 1.88× | High-fidelity K or V |
+| q6_0 | upstream | 6.5 | 2.46× | Robust type for high-end presets |
 | q5_1 | upstream | 6 | 2.67× | Conservative, might be better for V than q5_0 |
 | q5_0 | upstream | 5.5 | 2.91× | Strong K type for VRAM constrained configs |
 | q4_1 | upstream | 5 | 3.2× | Smaller than q5_0, but weaker in the tail. Prefer q5_0 for K |
