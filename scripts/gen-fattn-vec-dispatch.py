@@ -26,6 +26,8 @@ DEFAULT_PAIRS = [
     ("GGML_TYPE_TURBO2_0",   "GGML_TYPE_TURBO2_0"),
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO3_0"),
     ("GGML_TYPE_TURBO4_0",   "GGML_TYPE_TURBO4_0"),
+    ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_TURBO3_TCQ"),
+    ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_TURBO2_TCQ"),
     ("GGML_TYPE_TURBO2_0",   "GGML_TYPE_Q8_0"),
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_Q8_0"),
     ("GGML_TYPE_TURBO4_0",   "GGML_TYPE_Q8_0"),
@@ -36,8 +38,6 @@ DEFAULT_PAIRS = [
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO4_0"),
     ("GGML_TYPE_TURBO2_0",   "GGML_TYPE_TURBO3_0"),
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO2_0"),
-    ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_TURBO3_TCQ"),
-    ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_TURBO2_TCQ"),
     ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_Q8_0"),
     ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_Q8_0"),
     ("GGML_TYPE_Q8_0",       "GGML_TYPE_TURBO3_TCQ"),
@@ -52,18 +52,27 @@ def emit_pair(k, v):
     print(f"    FATTN_VEC_CASES_ALL_D_512({k}, {v})")
 
 print("#if defined(GGML_CUDA_FA_ALL_QUANTS)")
+all_count = 0
 for k, _ in TYPES:
     for v, _ in TYPES:
         emit_pair(k, v)
+        all_count += 1
 
 print("#elif defined(GGML_CUDA_FA_HALF_QUANTS)")
+half_count = 0
 for ki, (k, _) in enumerate(TYPES):
     for vi, (v, _) in enumerate(TYPES):
-        if ki <= vi:
+        if ki <= vi or k == "GGML_TYPE_F16" or v == "GGML_TYPE_F16":
             emit_pair(k, v)
+            half_count += 1
 
 print("#else")
 for k, v in DEFAULT_PAIRS:
     emit_pair(k, v)
 
 print("#endif")
+
+assert len(TYPES) == 13
+assert all_count == 169, all_count
+assert half_count == 103, half_count
+assert len(DEFAULT_PAIRS) == 27, len(DEFAULT_PAIRS)

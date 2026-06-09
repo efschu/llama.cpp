@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/root/.ccache \
       -DGGML_NATIVE=OFF \
       -DGGML_CUDA=ON \
       -DGGML_CUDA_FA=ON \
-      -DGGML_CUDA_FA_ALL_QUANTS=ON \
+      -DGGML_CUDA_FA_HALF_QUANTS=ON \
       -DGGML_BACKEND_DL=ON \
       -DGGML_CPU_ALL_VARIANTS=ON \
       -DLLAMA_BUILD_TESTS=OFF \

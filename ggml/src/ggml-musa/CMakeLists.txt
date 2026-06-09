@@ -83,14 +83,24 @@ if (MUSAToolkit_FOUND)
         list(LENGTH GGML_CUDA_FA_KV_TYPES_ORDERED GGML_CUDA_FA_KV_TYPES_LEN)
         math(EXPR GGML_CUDA_FA_KV_TYPES_LAST "${GGML_CUDA_FA_KV_TYPES_LEN} - 1")
 
+    set(GGML_CUDA_FA_HALF_PAIR_COUNT 0)
+
         foreach(KI RANGE 0 ${GGML_CUDA_FA_KV_TYPES_LAST})
             list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${KI} K_TYPE)
 
-            foreach(VI RANGE ${KI} ${GGML_CUDA_FA_KV_TYPES_LAST})
+            foreach(VI RANGE 0 ${GGML_CUDA_FA_KV_TYPES_LAST})
                 list(GET GGML_CUDA_FA_KV_TYPES_ORDERED ${VI} V_TYPE)
-                ggml_add_fattn_vec_pair_musa(GGML_SOURCES_MUSA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
+
+                if (KI LESS_EQUAL VI OR K_TYPE STREQUAL "f16" OR V_TYPE STREQUAL "f16")
+                    ggml_add_fattn_vec_pair_musa(GGML_SOURCES_MUSA "${FA_VEC_PREFIX}" "${K_TYPE}" "${V_TYPE}")
+                    math(EXPR GGML_CUDA_FA_HALF_PAIR_COUNT "${GGML_CUDA_FA_HALF_PAIR_COUNT} + 1")
+                endif()
             endforeach()
         endforeach()
+
+        if (NOT GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 103)
+            message(FATAL_ERROR "GGML_CUDA_FA_HALF_QUANTS expected 103 FA vec pairs, got ${GGML_CUDA_FA_HALF_PAIR_COUNT}")
+        endif()
 
         add_compile_definitions(GGML_CUDA_FA_HALF_QUANTS)
     else()

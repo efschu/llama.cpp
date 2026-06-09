@@ -22,13 +22,13 @@ Prebuilt Windows binaries (CUDA 12.4/13.1) are on the releases page. Otherwise b
 ```bash
 # Linux (GCC + CUDA)
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
-  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_HALF_QUANTS=ON \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 
 # Windows (MSVC + CUDA)
 cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON ^
-  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_HALF_QUANTS=ON ^
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel
 
@@ -37,7 +37,7 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-`GGML_CUDA_FA_ALL_QUANTS=ON` is required for TurboQuant and TCQ cache types. `GGML_CUDA_FA_HALF_QUANTS=ON` is an alternative that compiles only the useful K>=V half of the K/V pair matrix (compiling 91 FA vec K/V pairs instead of 169, reducing FA vec pair instances by ~46% vs ALL_QUANTS). These two flags are mutually exclusive. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
+`GGML_CUDA_FA_HALF_QUANTS=ON` is the recommended CUDA FlashAttention build mode for this fork. It compiles the useful asymmetric K/V cache type half-matrix plus f16 fallback pairs needed by TurboQuant/TCQ dequant paths: 103 FA vec K/V pairs instead of 169 in ALL_QUANTS. `GGML_CUDA_FA_ALL_QUANTS=ON` remains available for the full K/V matrix and arbitrary asymmetric cache-type combinations. These two flags are mutually exclusive. Add `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090, or `-DCMAKE_CUDA_ARCHITECTURES=89` for RTX 4090, if cross-compiling or building in CI without a GPU.
 
 Key binaries: `build/bin/llama-server`, `build/bin/llama-cli`, `build/bin/llama-bench`, `build/bin/llama-perplexity`.
 
