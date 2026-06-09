@@ -1362,6 +1362,7 @@ jobs:
           PREVIEW: ${{ needs.release-meta.outputs.preview }}
           SOURCE_REF: ${{ needs.release-meta.outputs.source_ref }}
           SOURCE_SHA: ${{ needs.release-meta.outputs.source_sha }}
+          SHORT_SHA: ${{ needs.release-meta.outputs.short_sha }}
           IMAGE_REPO: ${{ needs.release-meta.outputs.image_repo }}
         run: |
           set -euo pipefail
@@ -1385,7 +1386,7 @@ jobs:
           if [[ "${PREVIEW}" == "true" ]]; then
             {
               echo "> [!WARNING]"
-              echo "> Rolling preview build from \`${SOURCE_REF}\` at \`${SOURCE_SHA}\`. Assets and moving Docker tags are replaced by newer successful branch builds."
+              echo "> Rolling preview build from [\`${SOURCE_REF}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${SOURCE_REF}) at [\`${SHORT_SHA}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${SOURCE_SHA}). Assets and moving Docker tags are replaced by newer successful branch builds. Last updated: $(date -u +'%d/%m/%Y %H:%M')."
               echo
               cat release-notes.md
             } > release-notes-preview.md
