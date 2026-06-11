@@ -125,6 +125,7 @@ int main(int argc, char ** argv) {
     const std::string ggml_c = read_file(root + "/ggml/src/ggml.c");
     const std::string ggml_quants_h = read_file(root + "/ggml/src/ggml-quants.h");
     const std::string ggml_quants_c = read_file(root + "/ggml/src/ggml-quants.c");
+    const std::string ggml_turbo_quant_c = read_file(root + "/ggml/src/ggml-turbo-quant.c");
     const std::string ggml_cpu_c = read_file(root + "/ggml/src/ggml-cpu/ggml-cpu.c");
     const std::string ggml_cpu_quants_h = read_file(root + "/ggml/src/ggml-cpu/quants.h");
     const std::string ggml_cpu_quants_c = read_file(root + "/ggml/src/ggml-cpu/quants.c");
@@ -173,6 +174,9 @@ int main(int argc, char ** argv) {
     const std::string cuda_getrows = read_file(root + "/ggml/src/ggml-cuda/getrows.cu");
     const std::string cuda_set_rows = read_file(root + "/ggml/src/ggml-cuda/set-rows.cu");
     const std::string cuda_fattn_common = read_file(root + "/ggml/src/ggml-cuda/fattn-common.cuh");
+    const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
+    const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
+    const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_vec_q4_0_q4_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu");
     const std::string cuda_fattn_vec_q4_1_q4_1 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu");
     const std::string cuda_fattn_vec_q5_0_q5_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu");
@@ -186,7 +190,16 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec_q6_0_q6_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q6_0-q6_0.cu");
     const std::string cuda_fattn_vec_q6_0_q8_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q6_0-q8_0.cu");
     const std::string cuda_fattn_vec_q8_0_q6_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-q6_0.cu");
+    const std::string cuda_fattn_vec_q6_1_q6_1 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q6_1-q6_1.cu");
+    const std::string cuda_fattn_vec_q3_0_q3_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q3_0-q3_0.cu");
+    const std::string cuda_fattn_vec_q3_1_q3_1 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q3_1-q3_1.cu");
+    const std::string cuda_fattn_vec_q2_0_q2_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q2_0-q2_0.cu");
+    const std::string cuda_fattn_vec_q2_1_q2_1 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q2_1-q2_1.cu");
+    const std::string cuda_fattn_vec_turbo4_tcq_turbo4_tcq = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo4_tcq-turbo4_tcq.cu");
+    const std::string cuda_fattn_vec_q8_0_turbo4_tcq = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_tcq.cu");
+    const std::string cuda_fattn_vec_turbo4_tcq_q8_0 = read_file_optional(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-turbo4_tcq-q8_0.cu");
     const std::string cuda_template_generator = read_file(root + "/ggml/src/ggml-cuda/template-instances/generate_cu_files.py");
+    const std::string cuda_dispatch_generator = read_file(root + "/scripts/gen-fattn-vec-dispatch.py");
     const std::string metal = read_file(root + "/ggml/src/ggml-metal/ggml-metal.metal");
     const std::string vulkan_cpp = read_file(root + "/ggml/src/ggml-vulkan/ggml-vulkan.cpp");
     const std::string vulkan_shader_gen = read_file(root + "/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp");
@@ -392,7 +405,7 @@ int main(int argc, char ** argv) {
         "CUDA FlashAttention all-quant dispatch must include D=512 q8_0 K/V cache pairs");
     ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_BF16, GGML_TYPE_BF16)") != std::string::npos,
         "CUDA FlashAttention all-quant dispatch must include D=512 bf16 K/V cache pairs");
-    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0,       GGML_TYPE_TURBO3_TCQ)") != std::string::npos &&
+    ok &= expect(cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_TCQ)") != std::string::npos &&
                  cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO3_TCQ, GGML_TYPE_Q8_0)") != std::string::npos,
         "CUDA FlashAttention all-quant dispatch must include D=512 TCQ mixed q8/turbo3 pairs");
     ok &= expect(cuda_fattn.find("hip_native_tcq_decode") != std::string::npos &&
@@ -460,6 +473,110 @@ int main(int argc, char ** argv) {
                  cuda_fattn_vec_q6_0_q8_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q6_0, GGML_TYPE_Q8_0);") != std::string::npos &&
                  cuda_fattn_vec_q8_0_q6_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q6_0);") != std::string::npos,
         "CUDA FlashAttention must dispatch and instantiate q6_0 KV cache pairs through D=512");
+    {
+        struct classic_kv_type {
+            const char * enum_name;
+            const char * lower_name;
+            const char * block_name;
+            const char * quantize_ref;
+            const char * dequantize;
+            const char * vec_dot;
+            const char * cuda_traits;
+            const char * cuda_quantize;
+            const std::string * fattn_instance;
+        };
+
+        const classic_kv_type classic_types[] = {
+            { "GGML_TYPE_Q6_1", "q6_1", "block_q6_1", "quantize_row_q6_1_ref", "dequantize_row_q6_1", "ggml_vec_dot_q6_1_q8_1", "ggml_cuda_type_traits<GGML_TYPE_Q6_1>", "quantize_f32_q6_1_block", &cuda_fattn_vec_q6_1_q6_1 },
+            { "GGML_TYPE_Q3_0", "q3_0", "block_q3_0", "quantize_row_q3_0_ref", "dequantize_row_q3_0", "ggml_vec_dot_q3_0_q8_0", "ggml_cuda_type_traits<GGML_TYPE_Q3_0>", "quantize_f32_q3_0_block", &cuda_fattn_vec_q3_0_q3_0 },
+            { "GGML_TYPE_Q3_1", "q3_1", "block_q3_1", "quantize_row_q3_1_ref", "dequantize_row_q3_1", "ggml_vec_dot_q3_1_q8_1", "ggml_cuda_type_traits<GGML_TYPE_Q3_1>", "quantize_f32_q3_1_block", &cuda_fattn_vec_q3_1_q3_1 },
+            { "GGML_TYPE_Q2_0", "q2_0", "block_q2_0", "quantize_row_q2_0_ref", "dequantize_row_q2_0", "ggml_vec_dot_q2_0_q8_0", "ggml_cuda_type_traits<GGML_TYPE_Q2_0>", "quantize_f32_q2_0_block", &cuda_fattn_vec_q2_0_q2_0 },
+            { "GGML_TYPE_Q2_1", "q2_1", "block_q2_1", "quantize_row_q2_1_ref", "dequantize_row_q2_1", "ggml_vec_dot_q2_1_q8_1", "ggml_cuda_type_traits<GGML_TYPE_Q2_1>", "quantize_f32_q2_1_block", &cuda_fattn_vec_q2_1_q2_1 },
+        };
+
+        for (const classic_kv_type & type : classic_types) {
+            const std::string type_name(type.lower_name);
+            const std::string enum_name(type.enum_name);
+
+            ok &= expect(ggml_h.find(type.enum_name) != std::string::npos &&
+                         ggml_common_h.find(type.block_name) != std::string::npos &&
+                         ggml_c.find(".type_name                = \"" + type_name + "\"") != std::string::npos,
+                ("GGML core type metadata must register " + type_name).c_str());
+            ok &= expect(ggml_quants_h.find(type.quantize_ref) != std::string::npos &&
+                         ggml_quants_h.find(type.dequantize) != std::string::npos &&
+                         ggml_quants_c.find(type.quantize_ref) != std::string::npos &&
+                         ggml_quants_c.find(type.dequantize) != std::string::npos,
+                ("GGML quantization must provide reference quantize/dequantize for " + type_name).c_str());
+            ok &= expect(ggml_cpu_quants_h.find(type.vec_dot) != std::string::npos &&
+                         ggml_cpu_quants_c.find(std::string(type.vec_dot) + "_generic") != std::string::npos &&
+                         ggml_cpu_c.find("[" + enum_name + "]") != std::string::npos,
+                ("CPU backend traits must support " + type_name).c_str());
+            ok &= expect(arg_cpp.find(type.enum_name) != std::string::npos &&
+                         llama_bench.find(type.enum_name) != std::string::npos,
+                ("CLI and benchmark cache-type parsers must expose " + type_name).c_str());
+            ok &= expect(cuda_common.find(type.cuda_traits) != std::string::npos &&
+                         cuda_dequantize.find(std::string("dequantize_") + type.lower_name) != std::string::npos &&
+                         cuda_cpy_utils.find(type.cuda_quantize) != std::string::npos &&
+                         cuda_getrows.find(type.enum_name) != std::string::npos &&
+                         cuda_set_rows.find(type.enum_name) != std::string::npos &&
+                         cuda_cpy.find(type.enum_name) != std::string::npos &&
+                         cuda_cpp.find(type.enum_name) != std::string::npos,
+                ("CUDA backend must support SET_ROWS, GET_ROWS, CPY, and capability checks for " + type_name).c_str());
+            ok &= expect(cuda_fattn_common.find(std::string("vec_dot_fattn_vec_KQ_") + type.lower_name) != std::string::npos &&
+                         cuda_fattn_common.find(std::string("dequantize_V_") + type.lower_name) != std::string::npos &&
+                         cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(" + enum_name + ", " + enum_name + ")") != std::string::npos &&
+                         type.fattn_instance->find("DECL_FATTN_VEC_CASE(512, " + enum_name + ", " + enum_name + ");") != std::string::npos,
+                ("CUDA FlashAttention must dispatch and instantiate matched " + type_name + " KV cache pairs through D=512").c_str());
+        }
+    }
+    ok &= expect(ggml_h.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 ggml_common_h.find("block_turbo4_tcq") != std::string::npos &&
+                 ggml_c.find(".type_name                = \"turbo4_tcq\"") != std::string::npos,
+        "GGML core type metadata must register turbo4_tcq");
+    ok &= expect(GGML_TYPE_TURBO4_TCQ == 55 &&
+                 ggml_type_size(GGML_TYPE_TURBO4_TCQ) == 68,
+        "GGML runtime type metadata must preserve turbo4_tcq enum value and block size");
+    ok &= expect(ggml_quants_h.find("quantize_row_turbo4_tcq_ref") != std::string::npos &&
+                 ggml_quants_h.find("dequantize_row_turbo4_tcq") != std::string::npos &&
+                 ggml_turbo_quant_c.find("quantize_row_turbo4_tcq_ref") != std::string::npos &&
+                 ggml_turbo_quant_c.find("dequantize_row_turbo4_tcq") != std::string::npos &&
+                 ggml_c.find("GGML_TYPE_TURBO4_TCQ: result = quantize_turbo4_tcq") != std::string::npos,
+        "GGML quantization must provide turbo4_tcq reference metadata and chunk dispatch");
+    ok &= expect(arg_cpp.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 llama_bench.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 kv_cache_cpp.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 context_cpp.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 graph_cpp.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos,
+        "CLI, benchmark, and llama KV cache logic must expose turbo4_tcq");
+    ok &= expect(cuda_turbo_quant.find("d_turbo4_tcq_codebook") != std::string::npos &&
+                 cuda_turbo_quant.find("dequantize_turbo4_tcq") != std::string::npos &&
+                 cuda_turbo_quant.find("k_set_rows_turbo4_tcq") != std::string::npos &&
+                 cuda_getrows.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 cuda_set_rows.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 cuda_cpp.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos,
+        "CUDA backend must support turbo4_tcq SET_ROWS, GET_ROWS, and capability checks");
+    ok &= expect(cuda_fattn_common.find("vec_dot_fattn_vec_KQ_turbo4_tcq") != std::string::npos &&
+                 cuda_fattn_common.find("dequantize_V_turbo4_tcq") != std::string::npos &&
+                 cuda_fattn.find("k_turbo4_tcq_dequant_f16") != std::string::npos &&
+                 cuda_fattn_vec.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_TCQ, GGML_TYPE_TURBO4_TCQ)") != std::string::npos &&
+                 cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_TCQ)") != std::string::npos &&
+                 cuda_fattn.find("FATTN_VEC_CASES_ALL_D_512(GGML_TYPE_TURBO4_TCQ, GGML_TYPE_Q8_0)") != std::string::npos &&
+                 cuda_fattn_vec_turbo4_tcq_turbo4_tcq.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_TCQ, GGML_TYPE_TURBO4_TCQ);") != std::string::npos &&
+                 cuda_fattn_vec_q8_0_turbo4_tcq.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_TCQ);") != std::string::npos &&
+                 cuda_fattn_vec_turbo4_tcq_q8_0.find("DECL_FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_TCQ, GGML_TYPE_Q8_0);") != std::string::npos,
+        "CUDA FlashAttention must dispatch and instantiate turbo4_tcq matched and q8 mixed pairs through D=512");
+    ok &= expect(cuda_template_generator.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 cuda_template_generator.find("GGML_TYPE_Q6_1") != std::string::npos &&
+                 cuda_template_generator.find("GGML_TYPE_Q3_0") != std::string::npos &&
+                 cuda_template_generator.find("GGML_TYPE_Q2_1") != std::string::npos &&
+                 cuda_cmake.find("turbo4_tcq") != std::string::npos &&
+                 cuda_cmake.find("GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 208") != std::string::npos &&
+                 cuda_dispatch_generator.find("GGML_TYPE_TURBO4_TCQ") != std::string::npos &&
+                 cuda_dispatch_generator.find("assert len(TYPES) == 19") != std::string::npos &&
+                 cuda_dispatch_generator.find("assert all_count == 361") != std::string::npos &&
+                 cuda_dispatch_generator.find("assert half_count == 208") != std::string::npos,
+        "CUDA FlashAttention generators and CMake must include turbo4_tcq and the new q KV types in ALL/HALF matrices");
     ok &= expect(arch_cpp.find("{ LLM_ARCH_DFLASH,") != std::string::npos,
         "upstream dflash architecture must be registered separately");
     ok &= expect(convert_py.find("from conversion import") != std::string::npos,

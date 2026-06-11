@@ -455,6 +455,56 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q6_1) {
+        set_rows_cuda_quant<idx_t, block_q6_1, QK6_1, quantize_f32_q6_1_block>(
+            src0_d, src1_d, (block_q6_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q3_0) {
+        set_rows_cuda_quant<idx_t, block_q3_0, QK3_0, quantize_f32_q3_0_block>(
+            src0_d, src1_d, (block_q3_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q3_1) {
+        set_rows_cuda_quant<idx_t, block_q3_1, QK3_1, quantize_f32_q3_1_block>(
+            src0_d, src1_d, (block_q3_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q2_0) {
+        set_rows_cuda_quant<idx_t, block_q2_0, QK2_0, quantize_f32_q2_0_block>(
+            src0_d, src1_d, (block_q2_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_Q2_1) {
+        set_rows_cuda_quant<idx_t, block_q2_1, QK2_1, quantize_f32_q2_1_block>(
+            src0_d, src1_d, (block_q2_1*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else if (dst->type == GGML_TYPE_Q8_0) {
         set_rows_cuda_quant<idx_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
             src0_d, src1_d, (block_q8_0*)dst->data,
@@ -518,6 +568,68 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             src0_d, src1_d, (block_turbo4_0*)dst->data,
             ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13,
             nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+    } else if (dst->type == GGML_TYPE_TURBO4_TCQ) {
+        GGML_ASSERT(ne00 % QK_TURBO4_TCQ == 0);
+        const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO4_TCQ;
+        // Runtime codebook loading: TURBO_TCQ_CB4 overrides compiled-in 4-bit codebook (per-device)
+        {
+            static bool tcq4_cb_loaded[GGML_CUDA_MAX_DEVICES] = {};
+            if (!tcq4_cb_loaded[ctx.device]) {
+                tcq4_cb_loaded[ctx.device] = true;
+                const char *cb_path = getenv("TURBO_TCQ_CB4");
+                if (cb_path) {
+                    float cb[1024];
+                    FILE *f = fopen(cb_path, "rb");
+                    if (f && fread(cb, sizeof(float), 1024, f) == 1024) {
+                        fclose(f);
+                        cudaMemcpyToSymbol(d_turbo4_tcq_codebook, cb, 1024*sizeof(float));
+                        fprintf(stderr, "TCQ4 encode: loaded 4-bit codebook from %s (device %d)\n", cb_path, ctx.device);
+                    } else {
+                        if (f) fclose(f);
+                        fprintf(stderr, "TCQ4 encode: FAILED to load codebook from %s\n", cb_path);
+                    }
+                }
+                load_tcq_norm_alpha(ctx.device);
+                init_tcq_error_dump(ctx.device);
+            }
+        }
+        const int64_t s01_f = nb01/sizeof(float); const int64_t s02_f = nb02/sizeof(float); const int64_t s03_f = nb03/sizeof(float);
+        const int64_t s10_i = nb10/sizeof(idx_t); const int64_t s11_i = nb11/sizeof(idx_t); const int64_t s12_i = nb12/sizeof(idx_t);
+        const int iq_is_k = (strncmp(dst->name, "cache_k_", 8) == 0) ? 1 : 0;
+        if (ne_total_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
+            static int tcq4_use_shared_bt[GGML_CUDA_MAX_DEVICES] = {};
+            static bool tcq4_bt_checked[GGML_CUDA_MAX_DEVICES] = {};
+            constexpr int tcq4_bt_shared_bytes = 128 * 64;
+            if (!tcq4_bt_checked[ctx.device]) {
+                tcq4_bt_checked[ctx.device] = true;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                const char * tcq_shared_bt_env = getenv("TURBO_TCQ_SHARED_BT");
+                if (!tcq_shared_bt_env || atoi(tcq_shared_bt_env) != 0) {
+                    int max_shared_optin = 0;
+                    CUDA_CHECK(cudaDeviceGetAttribute(&max_shared_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, ctx.device));
+                    if (max_shared_optin >= tcq4_bt_shared_bytes) {
+                        CUDA_SET_SHARED_MEMORY_LIMIT(k_set_rows_turbo4_tcq<idx_t>, tcq4_bt_shared_bytes);
+                        tcq4_use_shared_bt[ctx.device] = 1;
+                        fprintf(stderr, "TCQ4 encode: using shared-memory backtrace (%d bytes/block)\n", tcq4_bt_shared_bytes);
+                    }
+                }
+#endif
+            }
+            if (!tcq4_use_shared_bt[ctx.device]) {
+                ensure_tcq_bt_buf(ctx.device, ne_total_groups * 128 * 64);
+            }
+            const uint3 ne00_fd = init_fastdiv_values((uint32_t) ne00);
+            const uint3 ne01_fd = init_fastdiv_values((uint32_t) ne01);
+            const uint3 ne02_fd = init_fastdiv_values((uint32_t) ne02);
+            const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
+            const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
+            const int shared_bytes = tcq4_use_shared_bt[ctx.device] ? tcq4_bt_shared_bytes : 0;
+            k_set_rows_turbo4_tcq<idx_t><<<(int)ne_total_groups, 1024, shared_bytes, stream>>>(
+                src0_d, src1_d, (block_turbo4_tcq *)dst->data,
+                ne_total_groups, tcq_bt_buf[ctx.device], tcq4_use_shared_bt[ctx.device], ne00, ne01, ne02, ne10, ne11, ne12, ne13,
+                s01_f, s02_f, s03_f, s10_i, s11_i, s12_i, iq_is_k, nb1, nb2, nb3,
+                ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        }
     } else if (dst->type == GGML_TYPE_TURBO3_TCQ) {
         GGML_ASSERT(ne00 % QK_TURBO3_TCQ == 0);
         const int64_t ne_total_groups = (ne00 * ne01 * ne02 * ne03) / QK_TURBO3_TCQ;
@@ -666,7 +778,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
 
     // Post-rotation extraction: one-time init
-    if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
+    if (h_extract_state == 0 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO4_TCQ || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
         static const char * env = getenv("TURBO_EXTRACT");
         if (env && atoi(env) > 0) {
             turbo_extract_init(atoi(env));
@@ -678,7 +790,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (h_extract_state == 1) turbo_extract_check_done();
 
     // InnerQ: one-time init on first turbo SET_ROWS call
-    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
+    if (innerq_state == 0 && (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO4_TCQ || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
         static const char * env = getenv("TURBO_INNERQ");
         if (env && atoi(env) > 0) {
             turbo_innerq_init();
@@ -692,7 +804,7 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
     // Track calibration progress
-    if (innerq_state == 1 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
+    if (innerq_state == 1 && (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO4_TCQ || dst->type == GGML_TYPE_TURBO3_TCQ || dst->type == GGML_TYPE_TURBO2_TCQ)) {
         innerq_tokens_seen += dst->src[0]->ne[1];
         if (innerq_tokens_seen >= INNERQ_CALIBRATION_TOKENS) {
             turbo_innerq_finalize_calibration();

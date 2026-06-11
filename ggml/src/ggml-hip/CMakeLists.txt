@@ -95,16 +95,22 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             f16
             bf16
             q8_0
+            q6_1
             q6_0
             q5_1
             q5_0
+            turbo4_tcq
             turbo4_0
             q4_1
             q4_0
+            q3_1
             turbo3_tcq
             turbo3_0
+            q3_0
+            q2_1
             turbo2_tcq
             turbo2_0
+            q2_0
         )
 
         list(LENGTH GGML_CUDA_FA_KV_TYPES_ORDERED GGML_CUDA_FA_KV_TYPES_LEN)
@@ -125,8 +131,8 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             endforeach()
         endforeach()
 
-        if (NOT GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 103)
-            message(FATAL_ERROR "GGML_CUDA_FA_HALF_QUANTS expected 103 FA vec pairs, got ${GGML_CUDA_FA_HALF_PAIR_COUNT}")
+        if (NOT GGML_CUDA_FA_HALF_PAIR_COUNT EQUAL 208)
+            message(FATAL_ERROR "GGML_CUDA_FA_HALF_QUANTS expected 208 FA vec pairs, got ${GGML_CUDA_FA_HALF_PAIR_COUNT}")
         endif()
 
         add_compile_definitions(GGML_CUDA_FA_HALF_QUANTS)
@@ -139,6 +145,7 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             turbo2_0:turbo2_0
             turbo3_0:turbo3_0
             turbo4_0:turbo4_0
+            turbo4_tcq:turbo4_tcq
             turbo3_tcq:turbo3_tcq
             turbo2_tcq:turbo2_tcq
             turbo2_0:q8_0
@@ -151,12 +158,20 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
             turbo3_0:turbo4_0
             turbo2_0:turbo3_0
             turbo3_0:turbo2_0
+            turbo4_tcq:q8_0
             turbo3_tcq:q8_0
             turbo2_tcq:q8_0
+            q8_0:turbo4_tcq
             q8_0:turbo3_tcq
             q8_0:turbo2_tcq
+            turbo4_tcq:turbo3_tcq
+            turbo3_tcq:turbo4_tcq
+            turbo4_tcq:turbo2_tcq
+            turbo2_tcq:turbo4_tcq
             turbo3_tcq:turbo2_tcq
             turbo2_tcq:turbo3_tcq
+            turbo4_0:turbo4_tcq
+            turbo3_0:turbo4_tcq
             turbo4_0:turbo3_tcq
             turbo3_0:turbo3_tcq
         )

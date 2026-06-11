@@ -6,16 +6,22 @@ TYPES = [
     ("GGML_TYPE_F16",        "f16"),
     ("GGML_TYPE_BF16",       "bf16"),
     ("GGML_TYPE_Q8_0",       "q8_0"),
+    ("GGML_TYPE_Q6_1",       "q6_1"),
     ("GGML_TYPE_Q6_0",       "q6_0"),
     ("GGML_TYPE_Q5_1",       "q5_1"),
     ("GGML_TYPE_Q5_0",       "q5_0"),
+    ("GGML_TYPE_TURBO4_TCQ", "turbo4_tcq"),
     ("GGML_TYPE_TURBO4_0",   "turbo4_0"),
     ("GGML_TYPE_Q4_1",       "q4_1"),
     ("GGML_TYPE_Q4_0",       "q4_0"),
+    ("GGML_TYPE_Q3_1",       "q3_1"),
     ("GGML_TYPE_TURBO3_TCQ", "turbo3_tcq"),
     ("GGML_TYPE_TURBO3_0",   "turbo3_0"),
+    ("GGML_TYPE_Q3_0",       "q3_0"),
+    ("GGML_TYPE_Q2_1",       "q2_1"),
     ("GGML_TYPE_TURBO2_TCQ", "turbo2_tcq"),
     ("GGML_TYPE_TURBO2_0",   "turbo2_0"),
+    ("GGML_TYPE_Q2_0",       "q2_0"),
 ]
 
 DEFAULT_PAIRS = [
@@ -26,6 +32,7 @@ DEFAULT_PAIRS = [
     ("GGML_TYPE_TURBO2_0",   "GGML_TYPE_TURBO2_0"),
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO3_0"),
     ("GGML_TYPE_TURBO4_0",   "GGML_TYPE_TURBO4_0"),
+    ("GGML_TYPE_TURBO4_TCQ", "GGML_TYPE_TURBO4_TCQ"),
     ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_TURBO3_TCQ"),
     ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_TURBO2_TCQ"),
     ("GGML_TYPE_TURBO2_0",   "GGML_TYPE_Q8_0"),
@@ -38,12 +45,20 @@ DEFAULT_PAIRS = [
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO4_0"),
     ("GGML_TYPE_TURBO2_0",   "GGML_TYPE_TURBO3_0"),
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO2_0"),
+    ("GGML_TYPE_TURBO4_TCQ", "GGML_TYPE_Q8_0"),
     ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_Q8_0"),
     ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_Q8_0"),
+    ("GGML_TYPE_Q8_0",       "GGML_TYPE_TURBO4_TCQ"),
     ("GGML_TYPE_Q8_0",       "GGML_TYPE_TURBO3_TCQ"),
     ("GGML_TYPE_Q8_0",       "GGML_TYPE_TURBO2_TCQ"),
+    ("GGML_TYPE_TURBO4_TCQ", "GGML_TYPE_TURBO3_TCQ"),
+    ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_TURBO4_TCQ"),
+    ("GGML_TYPE_TURBO4_TCQ", "GGML_TYPE_TURBO2_TCQ"),
+    ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_TURBO4_TCQ"),
     ("GGML_TYPE_TURBO3_TCQ", "GGML_TYPE_TURBO2_TCQ"),
     ("GGML_TYPE_TURBO2_TCQ", "GGML_TYPE_TURBO3_TCQ"),
+    ("GGML_TYPE_TURBO4_0",   "GGML_TYPE_TURBO4_TCQ"),
+    ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO4_TCQ"),
     ("GGML_TYPE_TURBO4_0",   "GGML_TYPE_TURBO3_TCQ"),
     ("GGML_TYPE_TURBO3_0",   "GGML_TYPE_TURBO3_TCQ"),
 ]
@@ -72,7 +87,7 @@ for k, v in DEFAULT_PAIRS:
 
 print("#endif")
 
-assert len(TYPES) == 13
-assert all_count == 169, all_count
-assert half_count == 103, half_count
-assert len(DEFAULT_PAIRS) == 27, len(DEFAULT_PAIRS)
+assert len(TYPES) == 19
+assert all_count == 361, all_count
+assert half_count == 208, half_count
+assert len(DEFAULT_PAIRS) == 36, len(DEFAULT_PAIRS)

@@ -35,15 +35,17 @@ int main(void) {
     printf("=== TurboQuant C Round-Trip Test ===\n\n");
 
     if (GGML_TYPE_TURBO3_TCQ != 45 || GGML_TYPE_TURBO2_TCQ != 46 ||
-        GGML_TYPE_TQ3_1S != 47 || GGML_TYPE_TQ4_1S != 48) {
-        printf("enum separation FAILED: turbo3_tcq=%d turbo2_tcq=%d tq3_1s=%d tq4_1s=%d\n",
-                GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S);
+        GGML_TYPE_TQ3_1S != 47 || GGML_TYPE_TQ4_1S != 48 ||
+        GGML_TYPE_TURBO4_TCQ != 55) {
+        printf("enum separation FAILED: turbo3_tcq=%d turbo2_tcq=%d tq3_1s=%d tq4_1s=%d turbo4_tcq=%d\n",
+                GGML_TYPE_TURBO3_TCQ, GGML_TYPE_TURBO2_TCQ, GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S, GGML_TYPE_TURBO4_TCQ);
         failed++;
     }
 
-    if (ggml_type_size(GGML_TYPE_TQ3_1S) != 16 || ggml_type_size(GGML_TYPE_TQ4_1S) != 20) {
-        printf("TQ type sizes FAILED: tq3_1s=%zu tq4_1s=%zu\n",
-                ggml_type_size(GGML_TYPE_TQ3_1S), ggml_type_size(GGML_TYPE_TQ4_1S));
+    if (ggml_type_size(GGML_TYPE_TQ3_1S) != 16 || ggml_type_size(GGML_TYPE_TQ4_1S) != 20 ||
+        ggml_type_size(GGML_TYPE_TURBO4_TCQ) != 68) {
+        printf("TQ type sizes FAILED: tq3_1s=%zu tq4_1s=%zu turbo4_tcq=%zu\n",
+                ggml_type_size(GGML_TYPE_TQ3_1S), ggml_type_size(GGML_TYPE_TQ4_1S), ggml_type_size(GGML_TYPE_TURBO4_TCQ));
         failed++;
     }
 

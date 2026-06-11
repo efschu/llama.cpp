@@ -4999,6 +4999,11 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q2_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_MXFP4:
@@ -5734,6 +5739,11 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_0:
+        case GGML_TYPE_Q6_1:
+        case GGML_TYPE_Q3_0:
+        case GGML_TYPE_Q3_1:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q2_1:
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
@@ -5763,6 +5773,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_TURBO3_TCQ:
         case GGML_TYPE_TURBO2_TCQ:
+        case GGML_TYPE_TURBO4_TCQ:
             {
                 // no-op
             }

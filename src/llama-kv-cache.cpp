@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <vector>
 
 // Turbo TCQ prompt cache safety: compute a fingerprint from the codebook env
 // vars so that loading a cache created with a different codebook is detected.
@@ -24,11 +25,11 @@ static uint32_t turbo_tcq_codebook_crc32(const char * path, size_t n_floats) {
     uint32_t crc = 0xFFFFFFFF;
     FILE * f = fopen(path, "rb");
     if (!f) { return 0; }
-    float buf[512];
-    size_t n = fread(buf, sizeof(float), n_floats, f);
+    std::vector<float> buf(n_floats);
+    size_t n = fread(buf.data(), sizeof(float), n_floats, f);
     fclose(f);
     if (n != n_floats) { return 0; }
-    const uint8_t * data = (const uint8_t *)buf;
+    const uint8_t * data = (const uint8_t *)buf.data();
     for (size_t i = 0; i < n_floats * sizeof(float); i++) {
         crc ^= data[i];
         for (int j = 0; j < 8; j++) {
@@ -41,18 +42,20 @@ static uint32_t turbo_tcq_codebook_crc32(const char * path, size_t n_floats) {
 static uint32_t turbo_tcq_fingerprint(void) {
     const char * cb3 = getenv("TURBO_TCQ_CB");
     const char * cb2 = getenv("TURBO_TCQ_CB2");
+    const char * cb4 = getenv("TURBO_TCQ_CB4");
     uint32_t h3 = turbo_tcq_codebook_crc32(cb3, 512);
     uint32_t h2 = turbo_tcq_codebook_crc32(cb2, 256);
-    return h3 ^ (h2 * 0x9E3779B9); // mix both hashes
+    uint32_t h4 = turbo_tcq_codebook_crc32(cb4, 1024);
+    return h3 ^ (h2 * 0x9E3779B9) ^ (h4 * 0x85EBCA6B); // mix all hashes
 }
 
 static bool ggml_type_is_turbo_tcq(enum ggml_type t) {
-    return t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+    return t == GGML_TYPE_TURBO4_TCQ || t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
 }
 
 static bool ggml_type_is_turbo_kv(enum ggml_type t) {
     return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 ||
-           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
+           t == GGML_TYPE_TURBO4_0 || t == GGML_TYPE_TURBO4_TCQ || t == GGML_TYPE_TURBO3_TCQ || t == GGML_TYPE_TURBO2_TCQ;
 }
 
 static bool ggml_is_power_of_2(int n) {

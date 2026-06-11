@@ -527,6 +527,21 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q6_0") {
         return GGML_TYPE_Q6_0;
     }
+    if (s == "q6_1") {
+        return GGML_TYPE_Q6_1;
+    }
+    if (s == "q3_0") {
+        return GGML_TYPE_Q3_0;
+    }
+    if (s == "q3_1") {
+        return GGML_TYPE_Q3_1;
+    }
+    if (s == "q2_0") {
+        return GGML_TYPE_Q2_0;
+    }
+    if (s == "q2_1") {
+        return GGML_TYPE_Q2_1;
+    }
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
@@ -538,6 +553,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     }
     if (s == "turbo4") {
         return GGML_TYPE_TURBO4_0;
+    }
+    if (s == "turbo4_tcq") {
+        return GGML_TYPE_TURBO4_TCQ;
     }
     if (s == "turbo3_tcq") {
         return GGML_TYPE_TURBO3_TCQ;

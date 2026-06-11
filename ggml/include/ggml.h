@@ -437,7 +437,13 @@ extern "C" {
         GGML_TYPE_TQ3_1S  = 47, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
         GGML_TYPE_TQ4_1S  = 48, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
         GGML_TYPE_Q6_0    = 49,
-        GGML_TYPE_COUNT   = 50,
+        GGML_TYPE_Q6_1    = 50,
+        GGML_TYPE_Q3_0    = 51,
+        GGML_TYPE_Q3_1    = 52,
+        GGML_TYPE_Q2_0    = 53,
+        GGML_TYPE_Q2_1    = 54,
+        GGML_TYPE_TURBO4_TCQ = 55, // TurboQuant 4-bit KV cache: TCQ (k=4, L=10, 1024 states)
+        GGML_TYPE_COUNT   = 56,
     };
 
     // precision

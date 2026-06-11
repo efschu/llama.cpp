@@ -118,6 +118,21 @@ typedef sycl::half2 ggml_half2;
 #define QI6_0 (QK6_0 / (4 * QR6_0))
 #define QR6_0 2
 
+#define QI6_1 (QK6_1 / (4 * QR6_1))
+#define QR6_1 2
+
+#define QI3_0 (QK3_0 / (4 * QR3_0))
+#define QR3_0 4
+
+#define QI3_1 (QK3_1 / (4 * QR3_1))
+#define QR3_1 4
+
+#define QI2_0 (QK2_0 / (4 * QR2_0))
+#define QR2_0 4
+
+#define QI2_1 (QK2_1 / (4 * QR2_1))
+#define QR2_1 4
+
 #define QI8_0 (QK8_0 / (4 * QR8_0))
 #define QR8_0 1
 
@@ -249,6 +264,64 @@ typedef struct {
 } block_q6_0;
 static_assert(sizeof(block_q6_0) == sizeof(ggml_half) + QK6_0 / 2 + QK6_0 / 4, "wrong q6_0 block size/padding");
 
+#define QK6_1 32
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d; // delta
+            ggml_half m; // min
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t qh[QK6_1 / 4];  // upper two bits of quants
+    uint8_t qs[QK6_1 / 2];  // lower four bits of quants
+} block_q6_1;
+static_assert(sizeof(block_q6_1) == 2 * sizeof(ggml_half) + QK6_1 / 2 + QK6_1 / 4, "wrong q6_1 block size/padding");
+
+// 3-bit: 2-bit planes in qs (byte j holds elements j, j+8, j+16, j+24), 3rd bit per element in qh
+#define QK3_0 32
+typedef struct {
+    ggml_half d;             // delta
+    uint8_t   qh[QK3_0 / 8]; // upper bit of quants
+    uint8_t   qs[QK3_0 / 4]; // lower two bits of quants
+} block_q3_0;
+static_assert(sizeof(block_q3_0) == sizeof(ggml_half) + QK3_0 / 8 + QK3_0 / 4, "wrong q3_0 block size/padding");
+
+#define QK3_1 32
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d; // delta
+            ggml_half m; // min
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t qh[QK3_1 / 8]; // upper bit of quants
+    uint8_t qs[QK3_1 / 4]; // lower two bits of quants
+} block_q3_1;
+static_assert(sizeof(block_q3_1) == 2 * sizeof(ggml_half) + QK3_1 / 8 + QK3_1 / 4, "wrong q3_1 block size/padding");
+
+// 2-bit: 2-bit planes in qs (byte j holds elements j, j+8, j+16, j+24)
+#define QK2_0 32
+typedef struct {
+    ggml_half d;             // delta
+    uint8_t   qs[QK2_0 / 4]; // quants, two bits each
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
+#define QK2_1 32
+typedef struct {
+    GGML_EXTENSION union {
+        struct {
+            ggml_half d; // delta
+            ggml_half m; // min
+        } GGML_COMMON_AGGR_S;
+        ggml_half2 dm;
+    } GGML_COMMON_AGGR_U;
+    uint8_t qs[QK2_1 / 4]; // quants, two bits each
+} block_q2_1;
+static_assert(sizeof(block_q2_1) == 2 * sizeof(ggml_half) + QK2_1 / 4, "wrong q2_1 block size/padding");
+
 #define QK8_0 32
 typedef struct {
     ggml_half d;       // delta
@@ -362,6 +435,18 @@ typedef struct {
     uint8_t    pad;                     //  1 byte:  alignment padding
 } block_turbo2_tcq;                     // 36 bytes total for 128 values (2.25 bpv)
 static_assert(sizeof(block_turbo2_tcq) == sizeof(ggml_half) + 34, "wrong turbo2_tcq block size/padding");
+
+// TurboQuant 4-bit TCQ: Trellis-Coded Quantization (right-shift bitshift trellis, k=4, L=10)
+// One block = one 128-element rotation group. Bitstream: 6 prefix + 128*4-bit outputs = 518 bits = 65 bytes.
+// Decode: state_t = read_10_bits(qs, t*4), recon_t = codebook[state_t] * norm
+// Stored struct size is 68 bytes per 128 values = 4.25 bits/value -> 3.76x storage compression vs fp16
+#define QK_TURBO4_TCQ 128
+typedef struct {
+    ggml_half  norm;                    //  2 bytes: corrected group L2 norm
+    uint8_t    qs[65];                  // 65 bytes: 518-bit trellis bitstream (2 padding bits)
+    uint8_t    pad;                     //  1 byte:  alignment padding
+} block_turbo4_tcq;                     // 68 bytes total for 128 values (4.25 bpv)
+static_assert(sizeof(block_turbo4_tcq) == sizeof(ggml_half) + 66, "wrong turbo4_tcq block size/padding");
 
 // TurboQuant 4-bit: 16-level PolarQuant (Lloyd-Max optimal for post-WHT Gaussian)
 // Per block: norm(fp16) + 4-bit indices (64 bytes)
