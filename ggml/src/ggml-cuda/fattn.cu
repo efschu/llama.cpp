@@ -1440,6 +1440,20 @@ static inline bool ggml_cuda_fattn_pair_compiled(const ggml_type type_K_in, cons
 #endif
 }
 
+const char * ggml_cuda_fa_build_policy() {
+#if defined(GGML_CUDA_FA_ALL_QUANTS)
+    return "all";
+#elif defined(GGML_CUDA_FA_HALF_QUANTS)
+    return "half";
+#else
+    return "default";
+#endif
+}
+
+bool ggml_cuda_fa_pair_compiled(ggml_type type_K, ggml_type type_V) {
+    return ggml_cuda_fattn_pair_compiled(type_K, type_V);
+}
+
 static inline bool ggml_cuda_fattn_prefers_native_vec_for_turbo_k_classic_v(
         const ggml_tensor * Q, const ggml_tensor * K, const ggml_tensor * V) {
     return ggml_cuda_fattn_is_turbo_kv_type(K->type) &&

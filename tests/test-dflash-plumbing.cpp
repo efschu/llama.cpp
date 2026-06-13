@@ -177,6 +177,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
+    const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
     const std::string cuda_fattn_vec_q4_0_q4_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu");
     const std::string cuda_fattn_vec_q4_1_q4_1 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q4_1-q4_1.cu");
     const std::string cuda_fattn_vec_q5_0_q5_0 = read_file(root + "/ggml/src/ggml-cuda/template-instances/fattn-vec-instance-q5_0-q5_0.cu");
@@ -718,7 +719,23 @@ int main(int argc, char ** argv) {
                      !cmake_has_default_pair("bf16:q4_0") &&
                      !cmake_has_default_pair("q8_0:q3_0") &&
                      !cmake_has_default_pair("q6_0:q3_0"),
-            "CUDA FlashAttention default build must cap fp at q5 and q8/q6 at q4 without f16/bf16 asymmetry");
+            "CUDA FlashAttention default build must enforce same-or-higher K precision and the two-tier-group V limit without f16/bf16 asymmetry");
+
+        ok &= expect(cuda_fattn_h.find("ggml_cuda_fa_build_policy") != std::string::npos &&
+                     cuda_fattn_h.find("ggml_cuda_fa_pair_compiled") != std::string::npos &&
+                     cuda_fattn.find("ggml_cuda_fa_build_policy") != std::string::npos &&
+                     cuda_fattn.find("ggml_cuda_fa_pair_compiled") != std::string::npos &&
+                     cuda_cpp.find("ggml_cuda_fa_build_policy") != std::string::npos &&
+                     cuda_cpp.find("ggml_cuda_fa_pair_compiled") != std::string::npos,
+            "CUDA backend must expose FA build policy and pair-compiled diagnostics through proc_address");
+        ok &= expect(cparams_h.find("flash_attn_required") != std::string::npos &&
+                     context_cpp.find("llama_cuda_fa_missing_pair_message") != std::string::npos &&
+                     context_cpp.find("is not compiled in this default build") != std::string::npos &&
+                     context_cpp.find("is not compiled in this HALF build") != std::string::npos &&
+                     context_cpp.find("failed to reserve graph for required Flash Attention check") != std::string::npos &&
+                     context_cpp.find("This is not a quant-pair build-policy miss") != std::string::npos &&
+                     context_cpp.find("Flash Attention was auto, set to disabled") != std::string::npos,
+            "llama-context must fail required CUDA FA missing pairs with build-specific text and only warn/disable optional auto FA");
 
         const std::string user_docs = readme_md + "\n" + agents_md + "\n" + claude_md + "\n" +
             docs_build_md + "\n" + quickstart_qwen36_md + "\n" + quickstart_gemma4_md;
@@ -732,8 +749,8 @@ int main(int argc, char ** argv) {
             "DFlash quickstart build commands must use default CUDA FA quant compilation");
         ok &= expect(user_docs.find("standard q cache types or KVarN") != std::string::npos &&
                      user_docs.find("TurboQuant/TCQ has not shown a benchmark advantage") != std::string::npos &&
-                     user_docs.find("K<V") != std::string::npos &&
-                     user_docs.find("K>>>V") != std::string::npos &&
+                     user_docs.find("same or higher precision than V") != std::string::npos &&
+                     user_docs.find("two tier groups") != std::string::npos &&
                      user_docs.find("GGML_CUDA_FA_HALF_QUANTS=ON") != std::string::npos &&
                      user_docs.find("GGML_CUDA_FA_ALL_QUANTS=ON") != std::string::npos,
             "User-facing docs must recommend default CUDA FA q/KVarN compilation while documenting HALF/ALL escape hatches");

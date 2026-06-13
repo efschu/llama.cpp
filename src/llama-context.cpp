@@ -30,6 +30,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 //
 // llama_context
@@ -71,6 +72,167 @@ static ggml_backend_reg_t dflash_gpu_backend_reg() {
         reg = ggml_backend_reg_by_name("ROCm");
     }
     return reg;
+}
+
+static bool llama_cache_type_is_turbo(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 ||
+           type == GGML_TYPE_TURBO3_0 ||
+           type == GGML_TYPE_TURBO4_0 ||
+           type == GGML_TYPE_TURBO2_TCQ ||
+           type == GGML_TYPE_TURBO3_TCQ ||
+           type == GGML_TYPE_TURBO4_TCQ;
+}
+
+struct llama_cuda_fa_pair_diag {
+    bool available = false;
+    bool pair_compiled = true;
+    const char * build_policy = nullptr;
+};
+
+struct llama_cuda_fa_device_mismatch {
+    bool found = false;
+    int layer = -1;
+    ggml_backend_dev_t device_kv = nullptr;
+    ggml_backend_dev_t device_fa = nullptr;
+    ggml_type type_k = GGML_TYPE_F16;
+    ggml_type type_v = GGML_TYPE_F16;
+};
+
+static llama_cuda_fa_pair_diag llama_cuda_fa_pair_diag_for(
+        ggml_backend_dev_t dev,
+        ggml_type type_k,
+        ggml_type type_v) {
+    llama_cuda_fa_pair_diag diag;
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (!reg) {
+        return diag;
+    }
+
+    using build_policy_fn_t = const char * (*)();
+    using pair_compiled_fn_t = bool (*)(ggml_type, ggml_type);
+
+    auto * fn_build_policy = (build_policy_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fa_build_policy");
+    auto * fn_pair_compiled = (pair_compiled_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_cuda_fa_pair_compiled");
+    if (!fn_build_policy || !fn_pair_compiled) {
+        return diag;
+    }
+
+    diag.available = true;
+    diag.build_policy = fn_build_policy();
+    diag.pair_compiled = fn_pair_compiled(type_k, type_v);
+    return diag;
+}
+
+static std::string llama_cuda_fa_pair_label(ggml_type type_k, ggml_type type_v) {
+    std::string msg = "K=";
+    msg += ggml_type_name(type_k);
+    msg += " V=";
+    msg += ggml_type_name(type_v);
+    return msg;
+}
+
+static std::string llama_cuda_fa_missing_pair_message(
+        const char * build_policy,
+        ggml_type type_k,
+        ggml_type type_v) {
+    const std::string pair = llama_cuda_fa_pair_label(type_k, type_v);
+    const std::string policy = build_policy ? build_policy : "";
+
+    if (policy == "default") {
+        return "CUDA FlashAttention cache pair " + pair + " is not compiled in this default build. "
+            "Default builds compile standard q/KVarN-fallback pairs only: K must be the same or higher precision than V, "
+            "and V may be no more than two tier groups below K. Tier groups are fp, high q, q5, q4, q3, and q2; "
+            "within a bit width, _1 ranks above _0. TurboQuant/TCQ and mixed f16/bf16 pairs are not compiled by default. "
+            "Use a default compiled pair, rebuild with GGML_CUDA_FA_HALF_QUANTS=ON for TurboQuant/TCQ or wider K>=V experiments, "
+            "or use GGML_CUDA_FA_ALL_QUANTS=ON for the full matrix.";
+    }
+
+    if (policy == "half") {
+        return "CUDA FlashAttention cache pair " + pair + " is not compiled in this HALF build. "
+            "HALF builds compile same-or-higher ranked K than V plus required f16 pairs. TurboQuant/TCQ is treated as "
+            "pseudo-equal to qX_1, so qX_1<->turboX pairs are compiled, but qX_0->turboX is excluded as K<V. "
+            "Use a HALF compiled pair or rebuild with GGML_CUDA_FA_ALL_QUANTS=ON for the full matrix.";
+    }
+
+    return "CUDA FlashAttention cache pair " + pair + " is not supported by this CUDA backend. "
+        "This is not a quant-pair build-policy miss; the cache type or attention shape is unsupported.";
+}
+
+static std::string llama_cuda_fa_generic_mismatch_message(const llama_cuda_fa_device_mismatch & mismatch) {
+    std::string msg = "Flash Attention tensor";
+    if (mismatch.layer >= 0) {
+        msg += " for layer ";
+        msg += std::to_string(mismatch.layer);
+    }
+    msg += " uses cache pair ";
+    msg += llama_cuda_fa_pair_label(mismatch.type_k, mismatch.type_v);
+    msg += " but is assigned to device ";
+    msg += mismatch.device_fa ? ggml_backend_dev_name(mismatch.device_fa) : "none";
+    msg += " while the layer/KV cache is assigned to device ";
+    msg += mismatch.device_kv ? ggml_backend_dev_name(mismatch.device_kv) : "none";
+    msg += " (usually due to missing backend support).";
+    return msg;
+}
+
+static llama_cuda_fa_device_mismatch llama_cuda_fa_find_device_mismatch(
+        ggml_backend_sched_t sched,
+        ggml_cgraph * gf,
+        const llama_model & model) {
+    llama_cuda_fa_device_mismatch mismatch;
+    if (!sched || !gf) {
+        return mismatch;
+    }
+
+    const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FATTN) + 1;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * n = ggml_graph_node(gf, i);
+        if (n->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+
+        ggml_backend_t backend_fa = ggml_backend_sched_get_tensor_backend(sched, n);
+        ggml_backend_dev_t device_fa = backend_fa ? ggml_backend_get_device(backend_fa) : nullptr;
+
+        GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
+        const int il = std::stoi(n->name + prefix_len);
+        ggml_backend_dev_t device_kv = model.dev_layer(il);
+
+        if (device_fa != device_kv) {
+            mismatch.found = true;
+            mismatch.layer = il;
+            mismatch.device_kv = device_kv;
+            mismatch.device_fa = device_fa;
+            if (n->src[1]) {
+                mismatch.type_k = n->src[1]->type;
+            }
+            if (n->src[2]) {
+                mismatch.type_v = n->src[2]->type;
+            }
+            return mismatch;
+        }
+    }
+
+    return mismatch;
+}
+
+static void llama_cuda_fa_report_or_throw(
+        const char * func,
+        const llama_cuda_fa_device_mismatch & mismatch,
+        bool required) {
+    const llama_cuda_fa_pair_diag diag =
+        llama_cuda_fa_pair_diag_for(mismatch.device_kv, mismatch.type_k, mismatch.type_v);
+
+    const std::string msg = diag.available && !diag.pair_compiled
+        ? llama_cuda_fa_missing_pair_message(diag.build_policy, mismatch.type_k, mismatch.type_v)
+        : llama_cuda_fa_generic_mismatch_message(mismatch);
+
+    if (required) {
+        LLAMA_LOG_ERROR("%s: %s\n", func, msg.c_str());
+        throw std::runtime_error(msg);
+    }
+
+    LLAMA_LOG_WARN("%s: %s\n", func, msg.c_str());
+    LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", func);
 }
 
 static bool dflash_is_cuda_compatible_tensor(const ggml_tensor * t) {
@@ -425,6 +587,12 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.flash_attn_required =
+        params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED ||
+        ggml_is_quantized(params.type_v) ||
+        llama_cache_type_is_turbo(params.type_k) ||
+        llama_cache_type_is_turbo(params.type_v) ||
+        params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
 
     cparams.fused_gdn_ar = !params.no_fused_gdn;
     cparams.fused_gdn_ch = !params.no_fused_gdn;
@@ -632,13 +800,14 @@ llama_context::llama_context(
         // Must enable FA BEFORE sched_reserve() so the scheduler knows FA is required
         // and builds the graph plan with FA ops on GPU from the start.
         {
-            const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4_TCQ || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
-            const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_TCQ || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
+            const bool turbo_k = llama_cache_type_is_turbo(params.type_k);
+            const bool turbo_v = llama_cache_type_is_turbo(params.type_v);
             if (turbo_k || turbo_v) {
                 if (!cparams.flash_attn) {
                     LLAMA_LOG_WARN("%s: turbo KV cache requires Flash Attention — enabling automatically\n", __func__);
                     cparams.flash_attn = true;
                 }
+                cparams.flash_attn_required = true;
                 cparams.auto_fa = false;  // turbo requires FA — don't let sched_reserve override
             }
         }
@@ -731,38 +900,29 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("failed to reserve graph for Flash Attention check");
         }
 
-        const size_t prefix_len = strlen(LLAMA_TENSOR_NAME_FATTN) + 1;
-        bool fa_device_mismatch = false;
-        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
-            ggml_tensor * n = ggml_graph_node(gf, i);
-            if (n->op != GGML_OP_FLASH_ATTN_EXT) {
-                continue;
-            }
-            ggml_backend_dev_t device_fa = ggml_backend_get_device(ggml_backend_sched_get_tensor_backend(sched.get(), n));
+        const llama_cuda_fa_device_mismatch fa_device_mismatch =
+            llama_cuda_fa_find_device_mismatch(sched.get(), gf, model);
 
-            // TODO: instead of the tensor names, use a map to keep track of which (FA) tensors belong to which layer
-            GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FATTN "-", prefix_len) == 0);
-            const int il = std::stoi(n->name + prefix_len);
-            ggml_backend_dev_t device_kv = model.dev_layer(il);
-            if (device_fa != device_kv) {
-                LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the Flash Attention tensor "
-                        "is assigned to device %s (usually due to missing support)\n",
-                        __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_fa));
-                // FIXME: fa_device_mismatch logic is wrong for --no-kv-offload, but this is broken anyways
-                fa_device_mismatch = true;
-                break;
-            }
-        }
-
-        if (fa_device_mismatch) {
+        if (fa_device_mismatch.found) {
+            llama_cuda_fa_report_or_throw(__func__, fa_device_mismatch, cparams.flash_attn_required);
             cparams.flash_attn = false;
-            LLAMA_LOG_WARN("%s: Flash Attention was auto, set to disabled\n", __func__);
         } else {
             cparams.flash_attn = true;
             LLAMA_LOG_INFO("%s: Flash Attention was auto, set to enabled\n", __func__);
         }
 
         cparams.auto_fa = false;
+    } else if (cparams.flash_attn && cparams.flash_attn_required) {
+        auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
+        if (!gf) {
+            throw std::runtime_error("failed to reserve graph for required Flash Attention check");
+        }
+
+        const llama_cuda_fa_device_mismatch fa_device_mismatch =
+            llama_cuda_fa_find_device_mismatch(sched.get(), gf, model);
+        if (fa_device_mismatch.found) {
+            llama_cuda_fa_report_or_throw(__func__, fa_device_mismatch, true);
+        }
     }
 
     if (cparams.auto_fgdn) {
@@ -8462,8 +8622,8 @@ llama_context * llama_init_from_model(
 
     // Auto-enable flash attention for turbo KV cache types
     {
-        const bool turbo_k = (params.type_k == GGML_TYPE_TURBO2_0 || params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4_TCQ || params.type_k == GGML_TYPE_TURBO3_TCQ || params.type_k == GGML_TYPE_TURBO2_TCQ);
-        const bool turbo_v = (params.type_v == GGML_TYPE_TURBO2_0 || params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_TCQ || params.type_v == GGML_TYPE_TURBO3_TCQ || params.type_v == GGML_TYPE_TURBO2_TCQ);
+        const bool turbo_k = llama_cache_type_is_turbo(params.type_k);
+        const bool turbo_v = llama_cache_type_is_turbo(params.type_v);
         if ((turbo_k || turbo_v) && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_WARN("%s: turbo KV cache requires flash attention — enabling automatically\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;

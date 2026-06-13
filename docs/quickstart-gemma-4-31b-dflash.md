@@ -71,7 +71,7 @@ cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON \
 cmake --build build -j
 ```
 
-The no-flag CUDA FlashAttention default is recommended for these quickstarts because it compiles the much faster 62-pair q/KVarN-fallback set for standard q cache types or KVarN. TurboQuant/TCQ has not shown a benchmark advantage over standard q or KVarN cache types in current fork benchmarks, so Turbo/TCQ FA pairs are not compiled by default. The pair policy keeps K>=V because K loses precision faster under quantization and K<V pairs are inefficient, but avoids K>>>V because large K/V tier gaps are unbalanced. Use `GGML_CUDA_FA_HALF_QUANTS=ON` only when you want TurboQuant/TCQ or high-delta K>=V experiments, and `GGML_CUDA_FA_ALL_QUANTS=ON` only if you need the full 361-pair K/V matrix. These flags are mutually exclusive.
+The no-flag CUDA FlashAttention default is recommended for these quickstarts because it compiles the much faster 62-pair q/KVarN-fallback set for standard q cache types or KVarN. TurboQuant/TCQ has not shown a benchmark advantage over standard q or KVarN cache types in current fork benchmarks, so Turbo/TCQ FA pairs are not compiled by default. The pair policy requires K to be the same or higher precision than V and keeps V within two tier groups of K. This reflects that K loses precision faster under quantization, lower-precision K than V is inefficient, and very large K/V tier gaps are unbalanced. Use `GGML_CUDA_FA_HALF_QUANTS=ON` only when you want TurboQuant/TCQ or high-delta K>=V experiments, and `GGML_CUDA_FA_ALL_QUANTS=ON` only if you need the full 361-pair K/V matrix. These flags are mutually exclusive.
 
 **macOS (Metal).**
 
