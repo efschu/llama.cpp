@@ -1624,42 +1624,63 @@ private:
         }
 
         // Disk-tier: restore from disk if slot was evicted
-        if (disk_cache && slot.disk_state == server_slot::kv_disk_state::ON_DISK && !slot.disk_path.empty()) {
-            SRV_INF("[disk-kv] slot %d restore start (session=%s, file=%s)\n",
-                    slot.id, slot.session_id.c_str(), slot.disk_path.c_str());
-
-            const std::string filepath = slot.disk_path;
+        if (disk_cache && !slot.disk_path.empty()) {
+            server_slot::kv_disk_state state_snapshot;
             {
                 std::lock_guard lock(*slot.disk_mu);
-                slot.disk_state = server_slot::kv_disk_state::PENDING_READ;
+                state_snapshot = slot.disk_state;
             }
 
-            const int64_t t_start = ggml_time_us();
-            llama_tokens tokens;
-            tokens.resize(slot.n_ctx);
-            size_t token_count = 0;
-            const size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
-            const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+            if (state_snapshot == server_slot::kv_disk_state::PENDING_WRITE) {
+                // Request arrived while worker is writing to disk.
+                // Cancel the pending write by setting state to NONE —
+                // the worker will detect this after the write and abort.
+                SRV_INF("[disk-kv] slot %d cancel pending write for incoming request\n", slot.id);
+                {
+                    std::lock_guard lock(*slot.disk_mu);
+                    slot.disk_state = server_slot::kv_disk_state::NONE;
+                }
+                // Wait briefly for the in-flight write to finish and clean up
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                // No restore needed — slot already has KV data in RAM
+            } else if (state_snapshot == server_slot::kv_disk_state::ON_DISK && !slot.disk_path.empty()) {
+                SRV_INF("[disk-kv] slot %d restore start (session=%s, file=%s)\n",
+                        slot.id, slot.session_id.c_str(), slot.disk_path.c_str());
 
-            // Clean up disk entry regardless of success/failure
-            disk_cache->record_delete_by_path(filepath);
-            {
-                std::lock_guard lock(*slot.disk_mu);
-                slot.disk_state = server_slot::kv_disk_state::NONE;
-                slot.disk_path.clear();
-                slot.disk_kv_bytes = 0;
-            }
+                const std::string filepath = slot.disk_path;
+                {
+                    std::lock_guard lock(*slot.disk_mu);
+                    slot.disk_state = server_slot::kv_disk_state::PENDING_READ;
+                }
 
-            if (nread > 0) {
-                tokens.resize(token_count);
-                slot.prompt.tokens.clear();
-                slot.prompt.tokens.insert(tokens);
-                SRV_INF("[disk-kv] slot %d restore OK (%zu tokens, %.1f MiB in %.2f ms)\n",
-                        slot.id, token_count, (double)nread / (1024.0 * 1024.0), t_ms);
-            } else {
-                SRV_ERR("[disk-kv] slot %d restore FAILED — cache invalidated\n", slot.id);
-                slot.prompt.tokens.clear();
+                const int64_t t_start = ggml_time_us();
+                llama_tokens tokens;
+                tokens.resize(slot.n_ctx);
+                size_t token_count = 0;
+                const size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
+                const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+                // Clean up disk entry regardless of success/failure
+                disk_cache->record_delete_by_path(filepath);
+                {
+                    std::lock_guard lock(*slot.disk_mu);
+                    slot.disk_state = server_slot::kv_disk_state::NONE;
+                    slot.disk_path.clear();
+                    slot.disk_kv_bytes = 0;
+                }
+
+                if (nread > 0) {
+                    tokens.resize(token_count);
+                    slot.prompt.tokens.clear();
+                    slot.prompt.tokens.insert(tokens);
+                    SRV_INF("[disk-kv] slot %d restore OK (%zu tokens, %.1f MiB in %.2f ms)\n",
+                            slot.id, token_count, (double)nread / (1024.0 * 1024.0), t_ms);
+                } else {
+                    SRV_ERR("[disk-kv] slot %d restore FAILED — cache invalidated\n", slot.id);
+                    slot.prompt.tokens.clear();
+                }
             }
+            // PENDING_READ: should not happen (only set during restore above)
         }
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
