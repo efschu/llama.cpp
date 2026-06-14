@@ -225,6 +225,7 @@ struct server_slot {
     int64_t                    disk_queued_at = 0;
     size_t                     disk_kv_bytes = 0;
     std::unique_ptr<std::mutex> disk_mu;
+    std::unique_ptr<std::atomic<bool>> disk_kv_read_done;
     std::string                session_id;  // persists across task resets
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -1183,6 +1184,7 @@ private:
         slots.resize(params_base.n_parallel);
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots[i].disk_mu = std::make_unique<std::mutex>();
+            slots[i].disk_kv_read_done = std::make_unique<std::atomic<bool>>(false);
         }
 
         // try speculative decoding
@@ -1632,16 +1634,16 @@ private:
             }
 
             if (state_snapshot == server_slot::kv_disk_state::PENDING_WRITE) {
-                // Request arrived while worker is writing to disk.
-                // Cancel the pending write by setting state to NONE —
-                // the worker will detect this after the write and abort.
                 SRV_INF("[disk-kv] slot %d cancel pending write for incoming request\n", slot.id);
                 {
                     std::lock_guard lock(*slot.disk_mu);
                     slot.disk_state = server_slot::kv_disk_state::NONE;
                 }
-                // Wait briefly for the in-flight write to finish and clean up
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                // Wait for worker to finish reading KV cache (llama_state_seq_save_file reads from KV memory)
+                while (!slot.disk_kv_read_done->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                slot.disk_kv_read_done->store(false, std::memory_order_release);
                 // No restore needed — slot already has KV data in RAM
             } else if (state_snapshot == server_slot::kv_disk_state::ON_DISK && !slot.disk_path.empty()) {
                 SRV_INF("[disk-kv] slot %d restore start (session=%s, file=%s)\n",
@@ -2414,6 +2416,8 @@ private:
 
                                     const int64_t t_start = ggml_time_us();
                                     const size_t written = llama_state_seq_save_file(sl_ptr->ctx_tgt, file.c_str(), sl_ptr->id, nullptr, 0);
+                                    // Signal that KV cache read is complete — safe for request thread to write
+                                    sl_ptr->disk_kv_read_done->store(true, std::memory_order_release);
                                     if (written > 0) {
                                         SRV_INF("[disk-kv] wrote %s (%.1f MiB in %.2f ms)\n",
                                                 file.c_str(),
@@ -2744,6 +2748,8 @@ private:
                         disk_io_pool->enqueue([this, sl_ptr, file]() {
                             const int64_t t_start = ggml_time_us();
                             const size_t written = llama_state_seq_save_file(sl_ptr->ctx_tgt, file.c_str(), sl_ptr->id, nullptr, 0);
+                            // Signal that KV cache read is complete — safe for request thread to write
+                            sl_ptr->disk_kv_read_done->store(true, std::memory_order_release);
                             if (written > 0) {
                                 SRV_INF("[disk-kv] wrote %s (%.1f MiB in %.2f ms)\n",
                                         file.c_str(),
