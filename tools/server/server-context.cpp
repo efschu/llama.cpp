@@ -1539,14 +1539,10 @@ private:
             // Disk-tier: handle disk-backed sessions (hot path and cold-start)
             if (disk_cache && !task.params.session_id.empty()) {
                 if (ret->disk_state == server_slot::kv_disk_state::ON_DISK) {
-                    // Hot path: slot was evicted to disk during this run
-                    const KvDiskEntry * entry = disk_cache->lookup_session(task.params.session_id);
-                    if (entry && entry->slot_id == ret->id) {
-                        SRV_INF("[disk-kv] slot %d has disk backup, removing disk entry and continuing\n", ret->id);
-                        ret->disk_state = server_slot::kv_disk_state::NONE;
-                        ret->disk_path.clear();
-                        disk_cache->record_delete(task.params.session_id);
-                    }
+                    // Hot path: slot was evicted to disk during this run.
+                    // Do NOT delete the disk entry here — the restore path in
+                    // launch_slot_with_task will read the file and clean up.
+                    SRV_INF("[disk-kv] slot %d has disk backup, will restore on launch\n", ret->id);
                 } else if (ret->disk_state == server_slot::kv_disk_state::NONE) {
                     // Cold-start: session exists on disk from a previous run
                     const KvDiskEntry * entry = disk_cache->lookup_session(task.params.session_id);
@@ -1627,6 +1623,44 @@ private:
             slot.lora = params_base.lora_adapters;
         }
 
+        // Disk-tier: restore from disk if slot was evicted
+        if (disk_cache && slot.disk_state == server_slot::kv_disk_state::ON_DISK && !slot.disk_path.empty()) {
+            SRV_INF("[disk-kv] slot %d restore start (session=%s, file=%s)\n",
+                    slot.id, slot.session_id.c_str(), slot.disk_path.c_str());
+
+            const std::string filepath = slot.disk_path;
+            {
+                std::lock_guard lock(*slot.disk_mu);
+                slot.disk_state = server_slot::kv_disk_state::PENDING_READ;
+            }
+
+            const int64_t t_start = ggml_time_us();
+            llama_tokens tokens;
+            tokens.resize(slot.n_ctx);
+            size_t token_count = 0;
+            const size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
+            const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+            // Clean up disk entry regardless of success/failure
+            disk_cache->record_delete_by_path(filepath);
+            {
+                std::lock_guard lock(*slot.disk_mu);
+                slot.disk_state = server_slot::kv_disk_state::NONE;
+                slot.disk_path.clear();
+                slot.disk_kv_bytes = 0;
+            }
+
+            if (nread > 0) {
+                tokens.resize(token_count);
+                slot.prompt.tokens.clear();
+                slot.prompt.tokens.insert(tokens);
+                SRV_INF("[disk-kv] slot %d restore OK (%zu tokens, %.1f MiB in %.2f ms)\n",
+                        slot.id, token_count, (double)nread / (1024.0 * 1024.0), t_ms);
+            } else {
+                SRV_ERR("[disk-kv] slot %d restore FAILED — cache invalidated\n", slot.id);
+                slot.prompt.tokens.clear();
+            }
+        }
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
         if (lora_all_alora(slot.lora)) {
@@ -2328,7 +2362,7 @@ private:
                                 const int64_t idle_sec = idle_us / 1000000;
                                 if (idle_sec < params_base.cache_disk_idle_sec) continue;
 
-                                const std::string session_id = sl.task ? sl.task->params.session_id : "";
+                                const std::string session_id = sl.session_id;
                                 if (session_id.empty()) continue;
 
                                 const size_t kv_size = llama_state_seq_get_size_ext(sl.ctx_tgt, sl.id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2348,6 +2382,15 @@ private:
                                 // Capture slot by pointer (slot lives in slots vector)
                                 server_slot * sl_ptr = &sl;
                                 disk_io_pool->enqueue([this, sl_ptr, session_id, file]() {
+                                    // Cancellation check BEFORE write
+                                    {
+                                        std::lock_guard lock(*sl_ptr->disk_mu);
+                                        if (sl_ptr->disk_state != server_slot::kv_disk_state::PENDING_WRITE) {
+                                            SRV_INF("[disk-kv] slot %d write cancelled (reactivated before write)\n", sl_ptr->id);
+                                            return;
+                                        }
+                                    }
+
                                     const int64_t t_start = ggml_time_us();
                                     const size_t written = llama_state_seq_save_file(sl_ptr->ctx_tgt, file.c_str(), sl_ptr->id, nullptr, 0);
                                     if (written > 0) {
@@ -2355,14 +2398,23 @@ private:
                                                 file.c_str(),
                                                 (double)written / (1024.0 * 1024.0),
                                                 (ggml_time_us() - t_start) / 1000.0);
+
+                                        // Cancellation check AFTER write
+                                        {
+                                            std::lock_guard lock(*sl_ptr->disk_mu);
+                                            if (sl_ptr->disk_state != server_slot::kv_disk_state::PENDING_WRITE) {
+                                                SRV_INF("[disk-kv] slot %d write cancelled (reactivated mid-write)\n", sl_ptr->id);
+                                                std::filesystem::remove(file);
+                                                return;
+                                            }
+                                        }
+
                                         disk_cache->record_write(sl_ptr->id, session_id, file, written, sl_ptr->disk_queued_at);
                                         {
                                             std::lock_guard lock(*sl_ptr->disk_mu);
                                             sl_ptr->disk_state = server_slot::kv_disk_state::ON_DISK;
                                         }
-                                        if (params_base.kv_unified) {
-                                            sl_ptr->prompt_clear(false);
-                                        }
+                                        sl_ptr->prompt_clear(false);
                                     } else {
                                         SRV_ERR("[disk-kv] failed to write %s\n", file.c_str());
                                         {
@@ -2700,7 +2752,7 @@ private:
 
                         const int64_t idle_us = ggml_time_us() - sl.t_last_used;
                         const int64_t idle_sec = idle_us / 1000000;
-                        if (idle_sec < params_base.cache_disk_idle_sec) continue;
+                        if (idle_sec < 2 * params_base.cache_disk_idle_sec) continue;
 
                         SRV_DBG("[disk-kv] slot %d cleanup orphaned disk entry after %lds idle\n", sl.id, idle_sec);
                         disk_cache->record_delete_by_path(sl.disk_path);
