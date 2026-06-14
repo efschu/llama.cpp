@@ -818,10 +818,7 @@ static __global__ void __launch_bounds__(512, 1) k_set_rows_turbo3_tcq(
     __syncthreads();
 
     if (sid == 0) turbo_extract_append(x);
-    if (sid == 0) cost[0] = grp_norm;
-    __syncthreads();
-
-    float saved_norm = cost[0];
+    const float saved_norm = grp_norm;
 
     // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
@@ -1122,12 +1119,10 @@ static __global__ void __launch_bounds__(1024, 1) k_set_rows_turbo4_tcq(
     __syncthreads();
 
     if (sid == 0) turbo_extract_append(x);
-    if (sid == 0) cost[0] = grp_norm;
-    __syncthreads();
-
-    float saved_norm = cost[0];
+    const float saved_norm = grp_norm;
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
     cost[sid] = 0.0f;
+    const float tcq_codebook_sid = d_turbo4_tcq_codebook[sid];
     __syncthreads();
 
     for (int t = 0; t < 128; t++) {
@@ -1154,7 +1149,7 @@ static __global__ void __launch_bounds__(1024, 1) k_set_rows_turbo4_tcq(
         __syncthreads();
 
         const int pred_idx = sid & 0x3F;
-        float dist = xt - d_turbo4_tcq_codebook[sid];
+        float dist = xt - tcq_codebook_sid;
         dist = dist * dist;
         cost_wr[sid] = pred_min_cost[pred_idx] + dist;
         __syncthreads();
@@ -1455,10 +1450,7 @@ static __global__ void __launch_bounds__(256, 1) k_set_rows_turbo2_tcq(
     __syncthreads();
 
     if (sid == 0) turbo_extract_append(x);
-    if (sid == 0) cost[0] = grp_norm;
-    __syncthreads();
-
-    float saved_norm = cost[0];
+    const float saved_norm = grp_norm;
 
     // Viterbi forward pass: double-buffered cost (1 sync/step, was 3)
     uint8_t * bt = use_shared_bt ? bt_shared : bt_buf + (int64_t)blockIdx.x * (128 * 64);
