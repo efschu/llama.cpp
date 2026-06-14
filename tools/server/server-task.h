@@ -85,6 +85,9 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
+    // session tracking for disk-tier KV-cache offload
+    std::string        session_id;
+
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
     std::string        control_cmpl_id;

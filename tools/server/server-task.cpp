@@ -618,6 +618,9 @@ task_params server_task::params_from_json_cmpl(
         throw std::runtime_error("n_cmpl cannot be greater than the number of slots, please increase -np");
     }
 
+    // Disk-tier KV-cache offload: extract session_id from request body
+    params.session_id = json_value(data, "session_id", std::string());
+
     return params;
 }
 
