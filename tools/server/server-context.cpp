@@ -1578,18 +1578,9 @@ private:
                     // Do NOT delete the disk entry here — the restore path in
                     // launch_slot_with_task will read the file and clean up.
                     SRV_INF("[disk-kv] slot %d has disk backup, will restore on launch\n", ret->id);
-            } else if (ret->disk_state == server_slot::kv_disk_state::NONE && !task.params.session_id.empty()) {
-                // Cold-start: session exists on disk from a previous run
-                const KvDiskEntry * entry = disk_cache->lookup_slot(ret->id);
-                if (entry) {
-                    SRV_INF("[disk-kv] slot %d assigned for cold-start restore of session %s\n",
-                            ret->id, task.params.session_id.c_str());
-                    ret->disk_state = server_slot::kv_disk_state::ON_DISK;
-                    ret->disk_path = entry->file;
-                    ret->disk_kv_bytes = entry->file_bytes;
                 }
+                // Cold-start is handled by restore_slot_states() at startup.
             }
-        }
         }
 
         return ret;
@@ -1598,8 +1589,6 @@ private:
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
         bool res = false;
 
