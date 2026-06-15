@@ -71,8 +71,10 @@ int main(int argc, char ** argv) {
     ok &= expect(helpers.find("? 2 : 1") != std::string::npos,
         "VEC FA min blocks must be 2 only for Turbo/TCQ pairs and 1 otherwise");
 
-    ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>()") != std::string::npos,
+    ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_nthreads_device(), (ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>())") != std::string::npos,
         "VEC FA launch_bounds must use the K/V type-aware min-block policy");
+    ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>()") == std::string::npos,
+        "VEC FA launch_bounds min-block expression must be parenthesized for HIP's variadic macro parser");
     ok &= expect(kernel.find("ggml_cuda_fattn_vec_get_nthreads_device(), 2") == std::string::npos,
         "VEC FA launch_bounds must not force all cache types to minBlocksPerSM=2");
 

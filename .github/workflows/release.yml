@@ -801,15 +801,8 @@ jobs:
           $ErrorActionPreference = "Stop"
           $bin = ".\build\bin\Release"
           Copy-Item ".\LICENSE" $bin
-          $redistRoot = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC"
-          $omp = Get-ChildItem $redistRoot -Recurse -Filter "libomp140.x86_64.dll" |
-            Where-Object { $_.FullName -like "*\debug_nonredist\x64\Microsoft.VC143.OpenMP.LLVM\libomp140.x86_64.dll" } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $omp) {
-            throw "VC143 x64 libomp140.x86_64.dll not found under $redistRoot"
-          }
-          Copy-Item $omp.FullName $bin -Force
+          $omp = & ".\scripts\find-msvc-openmp-runtime.ps1" -Architecture x64
+          Copy-Item -LiteralPath $omp -Destination $bin -Force
           python scripts\verify-windows-package.py $bin
           & "$bin\llama-server.exe" --version
           & "$bin\llama-cli.exe" --version
