@@ -664,6 +664,16 @@ static void test_store_legacy_parity_gpu() {
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
         for (bool value : { false, true }) {
             const std::vector<uint8_t> modern = test_store_records(
+                    backend, bits, value, false, 1, 2, 512, 200, false, true);
+            const std::vector<uint8_t> legacy = test_store_records(
+                    backend, bits, value, true, 1, 2, 512, 200, false, true);
+            require(modern == legacy, "KVarN CUDA split workspace store records differ from legacy path");
+        }
+    }
+
+    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (bool value : { false, true }) {
+            const std::vector<uint8_t> modern = test_store_records(
                     backend, bits, value, false, 1, 2, 16, 504, false, true);
             const std::vector<uint8_t> legacy = test_store_records(
                     backend, bits, value, true, 1, 2, 16, 504, false, true);

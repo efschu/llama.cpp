@@ -1140,15 +1140,14 @@ static __global__ void kvarn_store_workspace_flush_kernel(
 
     const int flush_start = flush_group * KVAR_N_DIM;
     const int stage_base = stream * KVAR_N_DIM * KVAR_N_STAGE_GROUPS;
-    const bool from_workspace = flush_start >= start_local && flush_start + KVAR_N_DIM <= end_local;
     float * tile = shared;
     for (int i = threadIdx.x; i < KVAR_N_TILE_VALUES; i += blockDim.x) {
         const int row = i / KVAR_N_DIM;
         const int col = i % KVAR_N_DIM;
         const int token = value ? row : col;
         const int dim = value ? col : row;
-        if (from_workspace) {
-            const int local_pos = flush_start + token;
+        const int local_pos = flush_start + token;
+        if (local_pos >= start_local && local_pos < end_local) {
             const int src_token = token_base + local_pos - start_local;
             tile[i] = __half2float(workspace[((int64_t) src_token * n_heads + head) * KVAR_N_DIM + dim]);
         } else {
