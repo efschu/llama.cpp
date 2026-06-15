@@ -26,6 +26,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <fstream>
 #include <utility>
 #include "disk_io_pool.h"
 #include "kv_disk_cache.h"
@@ -1187,6 +1188,38 @@ private:
             slots[i].disk_kv_read_done = std::make_unique<std::atomic<bool>>(false);
         }
 
+        // Warm-start: restore slot states from disk
+        if (disk_cache) {
+            disk_cache->restore_slot_states([&](int slot_id, const std::string & kvc_file,
+                                                 const std::string & tokens_file, size_t n_tokens) {
+                if ((size_t)slot_id >= slots.size()) return;
+                server_slot & sl = slots[slot_id];
+
+                // Load tokens from .tokens file
+                std::vector<llama_token> tokens;
+                try {
+                    std::ifstream tf(tokens_file, std::ios::binary);
+                    if (!tf.is_open()) return;
+                    uint32_t n;
+                    tf.read(reinterpret_cast<char*>(&n), sizeof(n));
+                    if (n > 0 && n < 10000000) {
+                        tokens.resize(n);
+                        tf.read(reinterpret_cast<char*>(tokens.data()), n * sizeof(llama_token));
+                    }
+                } catch (...) {
+                    return;
+                }
+
+                if (tokens.empty()) return;
+
+                sl.prompt.tokens.clear();
+                sl.prompt.tokens.insert(tokens);
+                sl.disk_state = server_slot::kv_disk_state::ON_DISK;
+                sl.disk_path = kvc_file;
+                sl.disk_kv_bytes = 0;
+                SRV_INF("[disk-kv] warm-start: slot %d restored (%zu tokens)\n", slot_id, tokens.size());
+            });
+        }
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
