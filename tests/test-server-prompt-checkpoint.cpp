@@ -3,6 +3,14 @@
 #undef NDEBUG
 #include <cassert>
 
+static constexpr size_t KIB = 1024;
+
+static server_prompt make_prompt(const llama_tokens & tokens) {
+    server_prompt prompt;
+    prompt.tokens = server_tokens(tokens, false);
+    return prompt;
+}
+
 int main() {
     server_prompt_checkpoint ckpt {
         /*.pos_min  = */ 1,
@@ -58,6 +66,57 @@ int main() {
     {
         server_prompt budgeted = server_prompt_clone_with_checkpoint_budget(prompt, 0, 0, 0);
         assert(budgeted.checkpoints.empty());
+    }
+
+    {
+        server_prompt_cache cache(1, 0);
+
+        server_prompt existing = make_prompt({1, 2});
+        existing.data.main.resize(700*KIB);
+        cache.states.push_back(std::move(existing));
+
+        server_prompt current = make_prompt({3, 4});
+        auto * saved = cache.alloc(current, 600*KIB, 0);
+
+        assert(saved != nullptr);
+        assert(cache.size() <= cache.limit_size);
+        assert(cache.states.size() == 1);
+        assert(cache.states.back().data.main.size() == 600*KIB);
+    }
+
+    {
+        server_prompt_cache cache(1, 0);
+
+        server_prompt existing = make_prompt({1, 2});
+        existing.data.main.resize(100*KIB);
+        cache.states.push_back(std::move(existing));
+
+        server_prompt current = make_prompt({3, 4});
+        auto & ckpt = current.checkpoints.emplace_back();
+        ckpt.n_tokens = 4;
+        ckpt.data_tgt.resize(200*KIB);
+
+        auto * saved = cache.alloc(current, 800*KIB, 0);
+
+        assert(saved != nullptr);
+        assert(cache.size() <= cache.limit_size);
+        assert(saved->checkpoints.empty());
+    }
+
+    {
+        server_prompt_cache cache(1, 0);
+
+        server_prompt existing = make_prompt({1, 2});
+        existing.data.main.resize(100*KIB);
+        cache.states.push_back(std::move(existing));
+
+        server_prompt current = make_prompt({3, 4});
+        server_prompt prepared;
+
+        assert(!cache.prepare_save(prepared, current, 800*KIB, 0, 300*KIB));
+        assert(prepared.size() == 0);
+        assert(cache.states.size() == 1);
+        assert(cache.size() == 100*KIB);
     }
 
     {

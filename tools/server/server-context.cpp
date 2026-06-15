@@ -883,7 +883,7 @@ struct server_slot : server_adaptive_dm_state {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, size_t reserved_size = 0) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -896,14 +896,28 @@ struct server_slot : server_adaptive_dm_state {
         const size_t cur_size = cur_size_tgt + cur_size_dft;
         const int64_t t_start = ggml_time_us();
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
+        server_prompt cur;
+        if (!prompt_cache.prepare_save(cur, prompt, cur_size_tgt, cur_size_dft, reserved_size)) {
             return false;
         }
 
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (cur_size_tgt > 0) {
+            const size_t n = llama_state_seq_get_data_ext(ctx_tgt, cur.data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n != cur_size_tgt) {
+                SRV_ERR("failed to save prompt target state: expected %zu bytes, got %zu\n", cur_size_tgt, n);
+                return false;
+            }
+        }
+        if (ctx_dft && cur_size_dft > 0) {
+            const size_t n = llama_state_seq_get_data_ext(ctx_dft, cur.data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n != cur_size_dft) {
+                SRV_ERR("failed to save prompt draft state: expected %zu bytes, got %zu\n", cur_size_dft, n);
+                return false;
+            }
+        }
+
+        if (!prompt_cache.commit_save(std::move(cur))) {
+            return false;
         }
 
         const double t_ms = (ggml_time_us() - t_start) / 1000.0;
@@ -2329,6 +2343,33 @@ private:
                llama_model_is_hybrid(model_tgt);
     }
 
+    size_t active_prompt_checkpoint_size() const {
+        size_t res = 0;
+
+        for (const auto & slot : slots) {
+            res += server_prompt_checkpoints_size(slot.prompt.checkpoints);
+        }
+
+        return res;
+    }
+
+    size_t prompt_host_cache_size() const {
+        return (prompt_cache ? prompt_cache->size() : 0) + active_prompt_checkpoint_size();
+    }
+
+    bool prompt_host_cache_would_exceed(size_t incoming_size) const {
+        if (!prompt_cache || prompt_cache->limit_size == 0) {
+            return false;
+        }
+
+        const size_t limit_size = prompt_cache->limit_size;
+        if (incoming_size > limit_size) {
+            return true;
+        }
+
+        return prompt_host_cache_size() > limit_size - incoming_size;
+    }
+
     void erase_oldest_checkpoint(server_slot & slot, const char * reason) {
         const auto & cur = slot.prompt.checkpoints.front();
 
@@ -3360,7 +3401,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                ret->prompt_save(*prompt_cache, active_prompt_checkpoint_size());
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens, prompt_cache_state_restore_allowed(*ret))) {
                     ret->prompt_clear(false);
@@ -4181,6 +4222,19 @@ private:
             erase_oldest_checkpoint(slot, "count limit");
         }
 
+        while (!slot.prompt.checkpoints.empty() && prompt_host_cache_would_exceed(new_size)) {
+            erase_oldest_checkpoint(slot, "RAM limit");
+        }
+
+        if (prompt_host_cache_would_exceed(new_size)) {
+            SLT_WRN(slot,
+                    "skipping context checkpoint: %.3f MiB state would exceed host prompt-cache budget (current = %.3f MiB, limit = %.3f MiB)\n",
+                    new_size / (1024.0 * 1024.0),
+                    prompt_host_cache_size() / (1024.0 * 1024.0),
+                    prompt_cache ? prompt_cache->limit_size / (1024.0 * 1024.0) : 0.0);
+            return;
+        }
+
         common_prompt_checkpoint cur;
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
@@ -4321,7 +4375,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                if (slot.prompt_save(*prompt_cache, active_prompt_checkpoint_size())) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }

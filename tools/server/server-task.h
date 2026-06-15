@@ -708,6 +708,15 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
+    bool prepare_save(
+            server_prompt & out,
+            const server_prompt & prompt,
+            size_t state_size_main,
+            size_t state_size_drft,
+            size_t reserved_size = 0);
+
+    bool commit_save(server_prompt && prompt);
+
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(

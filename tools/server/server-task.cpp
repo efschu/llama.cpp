@@ -2607,13 +2607,36 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+bool server_prompt_cache::prepare_save(
+        server_prompt & out,
+        const server_prompt & prompt,
+        size_t state_size_tgt,
+        size_t state_size_dft,
+        size_t reserved_size) {
+    out.clear();
+
     const size_t state_size = state_size_tgt + state_size_dft;
-    if (limit_size > 0 && state_size > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache limit %.3f MiB, skipping save\n",
-                state_size / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
+    if (limit_size > 0) {
+        const size_t available_after_reserved = reserved_size < limit_size ? limit_size - reserved_size : 0;
+        if (state_size > available_after_reserved) {
+            SRV_WRN(" - prompt state size %.3f MiB exceeds remaining cache budget %.3f MiB (reserved: %.3f MiB, limit: %.3f MiB), skipping save\n",
+                    state_size / (1024.0 * 1024.0),
+                    available_after_reserved / (1024.0 * 1024.0),
+                    reserved_size / (1024.0 * 1024.0),
+                    limit_size / (1024.0 * 1024.0));
+            return false;
+        }
     }
+
+    auto remaining_budget = [&]() -> size_t {
+        if (limit_size == 0 || reserved_size >= limit_size) {
+            return limit_size == 0 ? std::numeric_limits<size_t>::max() : 0;
+        }
+
+        const size_t after_reserved = limit_size - reserved_size;
+        const size_t cur_size = size();
+        return cur_size < after_reserved ? after_reserved - cur_size : 0;
+    };
 
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -2621,7 +2644,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_INF("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+            return false;
         }
     }
 
@@ -2638,13 +2661,44 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    if (limit_size > 0) {
+        while (!states.empty() && state_size > remaining_budget()) {
+            SRV_WRN(" - cache size limit would be exceeded by prompt save, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+            states.pop_front();
+        }
 
-    // check if we can allocate enough memory for the new state
+        const size_t budget = remaining_budget();
+        if (state_size > budget) {
+            SRV_WRN(" - prompt state size %.3f MiB cannot fit remaining cache budget %.3f MiB, skipping save\n",
+                    state_size / (1024.0 * 1024.0), budget / (1024.0 * 1024.0));
+            return false;
+        }
+    }
+
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        const size_t entry_limit = limit_size > 0 ? remaining_budget() : 0;
+        server_prompt cache_prompt = server_prompt_clone_with_checkpoint_budget(
+                prompt, state_size, entry_limit, SERVER_PROMPT_CACHE_MAX_CHECKPOINTS);
+
+        if (cache_prompt.checkpoints.size() != prompt.checkpoints.size()) {
+            if (limit_size > 0) {
+                SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu (max = %zu, available RAM = %.3f MiB)\n",
+                        prompt.checkpoints.size(),
+                        cache_prompt.checkpoints.size(),
+                        SERVER_PROMPT_CACHE_MAX_CHECKPOINTS,
+                        entry_limit / (1024.0 * 1024.0));
+            } else {
+                SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu (max = %zu, no RAM limit)\n",
+                        prompt.checkpoints.size(),
+                        cache_prompt.checkpoints.size(),
+                        SERVER_PROMPT_CACHE_MAX_CHECKPOINTS);
+            }
+        }
+
+        cache_prompt.data.main.resize(state_size_tgt);
+        cache_prompt.data.drft.resize(state_size_dft);
+        out = std::move(cache_prompt);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -2654,33 +2708,41 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 
         update();
 
+        return false;
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to prepare prompt cache state: %s\n", e.what());
+        return false;
+    }
+
+    return true;
+}
+
+bool server_prompt_cache::commit_save(server_prompt && prompt) {
+    try {
+        states.push_back(std::move(prompt));
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to commit prompt cache state: %s\n", e.what());
+        limit_size = std::max<size_t>(1, 0.4*size());
+        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
+        update();
+        return false;
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to commit prompt cache state: %s\n", e.what());
+        return false;
+    }
+
+    return true;
+}
+
+server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    server_prompt entry;
+    if (!prepare_save(entry, prompt, state_size_tgt, state_size_dft)) {
         return nullptr;
     }
 
-    server_prompt cache_prompt = server_prompt_clone_with_checkpoint_budget(prompt, state_size, limit_size, SERVER_PROMPT_CACHE_MAX_CHECKPOINTS);
-    if (cache_prompt.checkpoints.size() != prompt.checkpoints.size()) {
-        if (limit_size > 0) {
-            SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu (max = %zu, RAM limit = %.3f MiB)\n",
-                    prompt.checkpoints.size(),
-                    cache_prompt.checkpoints.size(),
-                    SERVER_PROMPT_CACHE_MAX_CHECKPOINTS,
-                    limit_size / (1024.0 * 1024.0));
-        } else {
-            SRV_WRN(" - pruned prompt cache checkpoints from %zu to %zu (max = %zu, no RAM limit)\n",
-                    prompt.checkpoints.size(),
-                    cache_prompt.checkpoints.size(),
-                    SERVER_PROMPT_CACHE_MAX_CHECKPOINTS);
-        }
+    if (!commit_save(std::move(entry))) {
+        return nullptr;
     }
-
-    states.push_back({
-        /*.tokens      =*/ std::move(cache_prompt.tokens),
-        /*.data        =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-        /*.checkpoints =*/ std::move(cache_prompt.checkpoints),
-    });
 
     return &states.back();
 }

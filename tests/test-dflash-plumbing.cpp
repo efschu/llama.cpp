@@ -270,6 +270,17 @@ int main(int argc, char ** argv) {
                  server_context.find("server_prompt_checkpoint_creation_allowed(") != std::string::npos &&
                  server_context.find("do_regular_context_checkpoint && do_checkpoint") != std::string::npos,
         "hybrid prompt cache must keep prompt-boundary checkpoints separate from regular context checkpoints");
+    {
+        const size_t host_size_helper = server_context.find("size_t prompt_host_cache_size() const");
+        const size_t checkpoint_budget = server_context.find("prompt_host_cache_would_exceed(new_size)");
+        const size_t checkpoint_alloc  = server_context.find("cur.data_tgt.resize(cur_size_tgt)");
+
+        ok &= expect(host_size_helper != std::string::npos &&
+                     checkpoint_budget != std::string::npos &&
+                     checkpoint_alloc  != std::string::npos &&
+                     checkpoint_budget < checkpoint_alloc,
+            "server context checkpoints must enforce the host prompt-cache RAM budget before allocating checkpoint state");
+    }
     ok &= expect(server_context.find("mark_mtp_draft_context_seq_rm_supported") == std::string::npos,
         "server must not keep the stale MTP seq_rm helper now that upstream probes ctx_dft directly");
 
