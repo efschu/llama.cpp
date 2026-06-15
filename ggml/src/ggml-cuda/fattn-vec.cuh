@@ -10,6 +10,17 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
     return 128;
 }
 
+template<ggml_type type>
+static constexpr __host__ __device__ bool ggml_cuda_fattn_vec_is_turbo_kv_type() {
+    return type == GGML_TYPE_TURBO2_0   || type == GGML_TYPE_TURBO3_0   || type == GGML_TYPE_TURBO4_0 ||
+           type == GGML_TYPE_TURBO2_TCQ || type == GGML_TYPE_TURBO3_TCQ || type == GGML_TYPE_TURBO4_TCQ;
+}
+
+template<ggml_type type_K, ggml_type type_V>
+static constexpr __host__ __device__ int ggml_cuda_fattn_vec_get_min_blocks() {
+    return ggml_cuda_fattn_vec_is_turbo_kv_type<type_K>() || ggml_cuda_fattn_vec_is_turbo_kv_type<type_V>() ? 2 : 1;
+}
+
 // Currently llvm with the amdgcn target does not support unrolling loops
 // that contain a break that can not be resolved at compile time.
 #ifdef __clang__
@@ -17,7 +28,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
 template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 2)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_get_min_blocks<type_K, type_V>())
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
@@ -84,12 +95,8 @@ static __global__ void flash_attn_ext_vec(
 #endif // GGML_USE_HIP
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr bool K_is_turbo = type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 ||
-                                type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO4_TCQ || type_K == GGML_TYPE_TURBO3_TCQ ||
-                                type_K == GGML_TYPE_TURBO2_TCQ;
-    constexpr bool V_is_turbo = type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0 ||
-                                type_V == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4_TCQ || type_V == GGML_TYPE_TURBO3_TCQ ||
-                                type_V == GGML_TYPE_TURBO2_TCQ;
+    constexpr bool K_is_turbo = ggml_cuda_fattn_vec_is_turbo_kv_type<type_K>();
+    constexpr bool V_is_turbo = ggml_cuda_fattn_vec_is_turbo_kv_type<type_V>();
     constexpr bool K_is_unquantized = type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || K_is_turbo;
     constexpr bool V_is_unquantized = type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16 || V_is_turbo;
     constexpr int nthreads_KQ = K_is_turbo ? 1 : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
@@ -169,13 +176,6 @@ static __global__ void flash_attn_ext_vec(
                                     (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 : 0;
     constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
-
-    // Sparse V threshold: skip V dequant for negligible attention weights.
-    // Positions with exp(score - max) below this contribute noise, not signal.
-    constexpr float sparse_v_threshold_f = 1e-6f;
-#ifdef V_DOT2_F32_F16_AVAILABLE
-    const     half  sparse_v_threshold_h = __float2half(sparse_v_threshold_f);
-#endif
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -452,15 +452,6 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 
-            if constexpr (!V_is_turbo) {
-                bool dominated = true;
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    if (__hgt(__low2half(KQ_k[j]), sparse_v_threshold_h)) { dominated = false; break; }
-                }
-                if (dominated) { continue; }
-            }
-
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                 half2 tmp[V_rows_per_thread/2];
@@ -502,15 +493,6 @@ static __global__ void flash_attn_ext_vec(
                 } else {
                     KQ_k[j] = KQ[j*nthreads + k];
                 }
-            }
-
-            if constexpr (!V_is_turbo) {
-                bool dominated = true;
-#pragma unroll
-                for (int j = 0; j < ncols; ++j) {
-                    if (KQ_k[j] >= sparse_v_threshold_f) { dominated = false; break; }
-                }
-                if (dominated) { continue; }
             }
 
 #pragma unroll

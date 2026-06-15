@@ -287,6 +287,7 @@ target_include_directories(test-dflash-plumbing PRIVATE ${PROJECT_SOURCE_DIR}/sr
 llama_build_and_test(test-mtmd-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-perplexity-plumbing.cpp ARGS ${PROJECT_SOURCE_DIR})
 llama_build_and_test(test-cuda-fattn-route-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
+llama_build_and_test(test-cuda-fattn-vec-policy.cpp ARGS ${PROJECT_SOURCE_DIR})
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
