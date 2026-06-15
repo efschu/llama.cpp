@@ -2460,7 +2460,11 @@ private:
                                             std::lock_guard lock(*sl_ptr->disk_mu);
                                             sl_ptr->disk_state = server_slot::kv_disk_state::ON_DISK;
                                         }
-                                        sl_ptr->prompt_clear(false);
+                                        // Free KV cells but preserve cache_tokens for prefix matching
+                                        common_context_seq_rm(sl_ptr->ctx_tgt, sl_ptr->id, -1, -1);
+                                        if (sl_ptr->ctx_dft) {
+                                            common_context_seq_rm(sl_ptr->ctx_dft, sl_ptr->id, -1, -1);
+                                        }
                                     } else {
                                         SRV_ERR("[disk-kv] failed to write %s\n", file.c_str());
                                         {
@@ -2745,9 +2749,7 @@ private:
                     for (server_slot & sl : slots) {
                         if (sl.disk_state != server_slot::kv_disk_state::NONE) continue;
                         if (sl.prompt.n_tokens() == 0) continue;
-                        if (sl.session_id.empty()) {
-                            sl.session_id = "auto-slot-" + std::to_string(sl.id);
-                        }
+                        // No session_id check — any idle slot with tokens is eligible
 
                         const int64_t idle_us = ggml_time_us() - sl.t_last_used;
                         const int64_t idle_sec = idle_us / 1000000;
@@ -2769,6 +2771,30 @@ private:
 
                         server_slot * sl_ptr = &sl;
                         disk_io_pool->enqueue([this, sl_ptr, file]() {
+                            // Write .tokens file (binary: uint32_t n + llama_token[n])
+                            const std::string tpath = disk_cache->tokens_path(sl_ptr->id);
+                            {
+                                std::vector<llama_token> tokens;
+                                {
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    const auto & toks = sl_ptr->prompt.tokens.get_tokens();
+                                    tokens = toks;
+                                }
+                                std::ofstream tf(tpath, std::ios::binary | std::ios::trunc);
+                                uint32_t n = static_cast<uint32_t>(tokens.size());
+                                tf.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                                if (n > 0) {
+                                    tf.write(reinterpret_cast<const char*>(tokens.data()), n * sizeof(llama_token));
+                                }
+                                if (!tf.good()) {
+                                    SRV_ERR("[disk-kv] slot %d .tokens write failed — aborting eviction\n", sl_ptr->id);
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    sl_ptr->disk_state = server_slot::kv_disk_state::NONE;
+                                    sl_ptr->disk_path.clear();
+                                    return;
+                                }
+                            }
+
                             const int64_t t_start = ggml_time_us();
                             const size_t written = llama_state_seq_save_file(sl_ptr->ctx_tgt, file.c_str(), sl_ptr->id, nullptr, 0);
                             // Signal that KV cache read is complete — safe for request thread to write
@@ -2778,10 +2804,26 @@ private:
                                         file.c_str(),
                                         (double)written / (1024.0 * 1024.0),
                                         (ggml_time_us() - t_start) / 1000.0);
+
+                                // Cancellation check AFTER write
+                                {
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    if (sl_ptr->disk_state != server_slot::kv_disk_state::PENDING_WRITE) {
+                                        SRV_INF("[disk-kv] slot %d write cancelled (reactivated mid-write)\n", sl_ptr->id);
+                                        std::filesystem::remove(file);
+                                        return;
+                                    }
+                                }
+
                                 disk_cache->record_write(sl_ptr->id, file, disk_cache->tokens_path(sl_ptr->id), written, sl_ptr->disk_queued_at, sl_ptr->prompt.n_tokens());
                                 {
                                     std::lock_guard lock(*sl_ptr->disk_mu);
                                     sl_ptr->disk_state = server_slot::kv_disk_state::ON_DISK;
+                                }
+                                // Free KV cells but preserve cache_tokens for prefix matching
+                                common_context_seq_rm(sl_ptr->ctx_tgt, sl_ptr->id, -1, -1);
+                                if (sl_ptr->ctx_dft) {
+                                    common_context_seq_rm(sl_ptr->ctx_dft, sl_ptr->id, -1, -1);
                                 }
                             } else {
                                 SRV_ERR("[disk-kv] failed to write %s\n", file.c_str());
