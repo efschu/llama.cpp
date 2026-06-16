@@ -62,9 +62,9 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-static bool kvarn_rotated_fa_enabled() {
+static bool kvarn_force_materialize_enabled() {
     static const bool enabled = [] {
-        const char * env = std::getenv("GGML_KVARN_ROTATED_FA");
+        const char * env = std::getenv("GGML_KVARN_FORCE_MATERIALIZE");
         return env != nullptr && env[0] != '\0' && std::atoi(env) != 0;
     }();
     return enabled;
@@ -2336,7 +2336,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
-    if (kvarn_rotated_fa_enabled()) {
+    if (!kvarn_force_materialize_enabled()) {
         if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
             inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
         }
@@ -2370,7 +2370,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
     const auto * kvarn_ctx =
-        (kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
+        (!kvarn_force_materialize_enabled() && inp->self_kvarn_rot) ?
             dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
     const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
@@ -2661,7 +2661,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_iswa = inp->mctx;
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
     const auto * kvarn_ctx =
-        (!is_swa && kvarn_rotated_fa_enabled() && inp->self_kvarn_rot) ?
+        (!is_swa && !kvarn_force_materialize_enabled() && inp->self_kvarn_rot) ?
             dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur) : nullptr;
     const bool use_kvarn_rotated = kvarn_ctx != nullptr && q_cur->ne[0] % 128 == 0;
 
@@ -2865,7 +2865,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
 
     inp->self_k_rot = mctx_cur->get_base()->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->get_base()->build_input_v_rot(ctx0);
-    if (kvarn_rotated_fa_enabled()) {
+    if (!kvarn_force_materialize_enabled()) {
         if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur->get_base())) {
             inp->self_kvarn_rot = kvarn->build_input_kvarn_rot(ctx0);
         }

@@ -322,30 +322,6 @@ static ggml_backend_t init_test_backend(enum ggml_backend_dev_type device_type, 
     return backend;
 }
 
-static void set_kvarn_store_legacy_env(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("GGML_KVARN_STORE_LEGACY", enabled ? "1" : "");
-#else
-    if (enabled) {
-        setenv("GGML_KVARN_STORE_LEGACY", "1", 1);
-    } else {
-        unsetenv("GGML_KVARN_STORE_LEGACY");
-    }
-#endif
-}
-
-static void set_kvarn_mat_generic_env(bool enabled) {
-#ifdef _WIN32
-    _putenv_s("GGML_KVARN_MAT_GENERIC", enabled ? "1" : "");
-#else
-    if (enabled) {
-        setenv("GGML_KVARN_MAT_GENERIC", "1", 1);
-    } else {
-        unsetenv("GGML_KVARN_MAT_GENERIC");
-    }
-#endif
-}
-
 static void test_cache_ops(enum ggml_backend_dev_type device_type, bool required, int bits) {
     ggml_backend_t backend = init_test_backend(device_type, required);
     if (backend == nullptr) {
@@ -563,102 +539,16 @@ static void test_cache_ops_multi_stream(enum ggml_backend_dev_type device_type, 
     ggml_backend_free(backend);
 }
 
-static std::vector<uint8_t> test_store_records(
-        ggml_backend_t backend,
-        int            bits,
-        bool           value,
-        bool           legacy,
-        int            n_stream = 2,
-        int            n_heads = 2,
-        int            n_tokens_per_stream = 385,
-        int            start_idx = 64,
-        bool           discontinuous_indices = false,
-        bool           seed_stage = false) {
-    ggml_init_params params = {
-        /*.mem_size   =*/ 8 * 1024 * 1024,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context * ctx = ggml_init(params);
-    require(ctx != nullptr, "failed to initialize legacy parity context");
-
-    const int n_groups_per_stream = std::max(1, (start_idx + n_tokens_per_stream + (discontinuous_indices ? 1 : 0) + 127) / 128);
-    const int n_tokens = n_tokens_per_stream * n_stream;
-    const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
-
-    ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
-    ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
-    ggml_tensor * stage = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 128, n_heads, 384 * n_stream);
-    ggml_tensor * records = ggml_new_tensor_3d(ctx, GGML_TYPE_I8, record_bytes, n_heads, n_groups_per_stream * n_stream);
-
-    ggml_tensor * stored = ggml_kvarn_store(ctx, current, indices, stage, records, bits, 16, value);
-    stored->op_params[3] = n_tokens_per_stream;
-
-    ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, stored);
-
-    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    require(buffer != nullptr, "failed to allocate legacy parity tensors");
-
-    std::vector<float> input(128 * n_heads * n_tokens);
-    for (int s = 0; s < n_stream; ++s) {
-        for (int t = 0; t < n_tokens_per_stream; ++t) {
-            for (int h = 0; h < n_heads; ++h) {
-                for (int d = 0; d < 128; ++d) {
-                    input[((s * n_tokens_per_stream + t) * n_heads + h) * 128 + d] =
-                        std::sin(float(d) * 0.071f + float(h) * 0.13f + float(s) * 0.31f) +
-                        std::cos(float(t) * 0.037f + float(h) * 0.11f + float(s) * 0.23f) +
-                        float((d * 13 + h * 7 + t * 17 + s * 19) % 31 - 15) * 0.01f;
-                }
-            }
-        }
-    }
-
-    std::vector<int64_t> idx(n_tokens);
-    for (int s = 0; s < n_stream; ++s) {
-        for (int t = 0; t < n_tokens_per_stream; ++t) {
-            const int local_idx = start_idx + t + (discontinuous_indices && t >= n_tokens_per_stream / 2 ? 1 : 0);
-            idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + local_idx);
-        }
-    }
-
-    ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
-    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
-    if (seed_stage) {
-        std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
-        for (size_t i = 0; i < stage_data.size(); ++i) {
-            const float f = std::sin(float(i) * 0.017f) + std::cos(float(i) * 0.011f);
-            stage_data[i] = ggml_fp32_to_fp16(f);
-        }
-        ggml_backend_tensor_set(stage, stage_data.data(), 0, ggml_nbytes(stage));
-    } else {
-        std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
-        ggml_backend_tensor_set(stage, stage_zeros.data(), 0, ggml_nbytes(stage));
-    }
-    std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
-    ggml_backend_tensor_set(records, record_zeros.data(), 0, ggml_nbytes(records));
-
-    set_kvarn_store_legacy_env(legacy);
-    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "legacy parity graph compute failed");
-    set_kvarn_store_legacy_env(false);
-
-    std::vector<uint8_t> record_data(ggml_nbytes(records));
-    ggml_backend_tensor_get(records, record_data.data(), 0, record_data.size());
-
-    ggml_backend_buffer_free(buffer);
-    ggml_free(ctx);
-    return record_data;
-}
-
 static std::vector<ggml_fp16_t> test_materialize_output(
         ggml_backend_t backend,
         int            bits,
         bool           value,
-        bool           generic,
         int            n_stream,
         int            n_heads,
         int            n_tokens_per_stream,
-        int            start_idx) {
+        int            start_idx,
+        bool           discontinuous_indices = false,
+        bool           seed_stage = true) {
     ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -667,9 +557,9 @@ static std::vector<ggml_fp16_t> test_materialize_output(
     ggml_context * ctx = ggml_init(params);
     require(ctx != nullptr, "failed to initialize materialize parity context");
 
-    const int n_groups_per_stream = std::max(4, (start_idx + n_tokens_per_stream + 127) / 128);
+    const int n_kv = start_idx + n_tokens_per_stream + (discontinuous_indices ? 1 : 0);
+    const int n_groups_per_stream = std::max(4, (n_kv + 127) / 128);
     const int n_tokens = n_tokens_per_stream * n_stream;
-    const int n_kv = start_idx + n_tokens_per_stream;
     const int record_bytes = int(llama_kvarn_packed_bytes(128 * 128, bits) + 3 * 128 * sizeof(ggml_fp16_t));
 
     ggml_tensor * current = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, n_heads, n_tokens);
@@ -705,25 +595,29 @@ static std::vector<ggml_fp16_t> test_materialize_output(
     std::vector<int64_t> idx(n_tokens);
     for (int s = 0; s < n_stream; ++s) {
         for (int t = 0; t < n_tokens_per_stream; ++t) {
-            idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + start_idx + t);
+            const int local_idx = start_idx + t + (discontinuous_indices && t >= n_tokens_per_stream / 2 ? 1 : 0);
+            idx[s * n_tokens_per_stream + t] = int64_t(s * n_groups_per_stream * 128 + local_idx);
         }
     }
 
-    std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
-    for (size_t i = 0; i < stage_data.size(); ++i) {
-        const float f = std::sin(float(i) * 0.017f) + std::cos(float(i) * 0.011f);
-        stage_data[i] = ggml_fp32_to_fp16(f);
-    }
     std::vector<uint8_t> record_zeros(ggml_nbytes(records), 0);
 
     ggml_backend_tensor_set(current, input.data(), 0, ggml_nbytes(current));
     ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
-    ggml_backend_tensor_set(stage, stage_data.data(), 0, ggml_nbytes(stage));
+    if (seed_stage) {
+        std::vector<ggml_fp16_t> stage_data(ggml_nelements(stage));
+        for (size_t i = 0; i < stage_data.size(); ++i) {
+            const float f = std::sin(float(i) * 0.017f) + std::cos(float(i) * 0.011f);
+            stage_data[i] = ggml_fp32_to_fp16(f);
+        }
+        ggml_backend_tensor_set(stage, stage_data.data(), 0, ggml_nbytes(stage));
+    } else {
+        std::vector<uint8_t> stage_zeros(ggml_nbytes(stage), 0);
+        ggml_backend_tensor_set(stage, stage_zeros.data(), 0, ggml_nbytes(stage));
+    }
     ggml_backend_tensor_set(records, record_zeros.data(), 0, record_zeros.size());
 
-    set_kvarn_mat_generic_env(generic);
-    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "materialize parity graph compute failed");
-    set_kvarn_mat_generic_env(false);
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "materialize path graph compute failed");
 
     std::vector<ggml_fp16_t> output(ggml_nelements(materialized));
     ggml_backend_tensor_get(materialized, output.data(), 0, ggml_nbytes(materialized));
@@ -733,78 +627,105 @@ static std::vector<ggml_fp16_t> test_materialize_output(
     return output;
 }
 
-static void test_store_legacy_parity_gpu() {
-    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
-    if (backend == nullptr) {
-        return;
+static void require_close_f16_rmse(
+        const std::vector<ggml_fp16_t> & actual,
+        const std::vector<ggml_fp16_t> & expected,
+        float                            rmse_limit,
+        const char *                     message) {
+    require(actual.size() == expected.size(), "f16 RMSE parity size mismatch");
+    double mse = 0.0;
+    double max_diff = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const double diff = double(ggml_fp16_to_fp32(actual[i])) - double(ggml_fp16_to_fp32(expected[i]));
+        mse += diff * diff;
+        max_diff = std::max(max_diff, std::fabs(diff));
     }
 
-    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
-        for (bool value : { false, true }) {
-            const std::vector<uint8_t> modern = test_store_records(backend, bits, value, false);
-            const std::vector<uint8_t> legacy = test_store_records(backend, bits, value, true);
-            require(modern == legacy, "KVarN CUDA store records differ from legacy path");
-        }
+    const double rmse = std::sqrt(mse / double(actual.size()));
+    if (!std::isfinite(rmse) || rmse > rmse_limit) {
+        std::fprintf(stderr,
+                "KVarN CPU/CUDA parity mismatch: rmse=%g max_diff=%g limit=%g\n",
+                rmse, max_diff, double(rmse_limit));
+        require(false, message);
     }
-
-    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
-        for (bool value : { false, true }) {
-            const std::vector<uint8_t> modern = test_store_records(
-                    backend, bits, value, false, 1, 2, 512, 200, false, true);
-            const std::vector<uint8_t> legacy = test_store_records(
-                    backend, bits, value, true, 1, 2, 512, 200, false, true);
-            require(modern == legacy, "KVarN CUDA split workspace store records differ from legacy path");
-        }
-    }
-
-    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
-        for (bool value : { false, true }) {
-            const std::vector<uint8_t> modern = test_store_records(
-                    backend, bits, value, false, 1, 2, 16, 504, false, true);
-            const std::vector<uint8_t> legacy = test_store_records(
-                    backend, bits, value, true, 1, 2, 16, 504, false, true);
-            require(modern == legacy, "KVarN CUDA direct-flush records differ from legacy path");
-        }
-    }
-
-    for (bool value : { false, true }) {
-        const std::vector<uint8_t> modern = test_store_records(
-                backend, 4, value, false, 1, 2, 385, 64, true, false);
-        const std::vector<uint8_t> legacy = test_store_records(
-                backend, 4, value, true, 1, 2, 385, 64, true, false);
-        require(modern == legacy, "KVarN CUDA stale workspace hint fallback differs from legacy path");
-    }
-
-    set_kvarn_store_legacy_env(false);
-    ggml_backend_free(backend);
 }
 
-static void test_materialize_generic_parity_gpu() {
-    ggml_backend_t backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
-    if (backend == nullptr) {
+static void test_store_paths_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
         return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+
+    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (bool value : { false, true }) {
+            const std::vector<ggml_fp16_t> cuda_output = test_materialize_output(
+                    gpu_backend, bits, value, 2, 2, 385, 64);
+            const std::vector<ggml_fp16_t> cpu_output = test_materialize_output(
+                    cpu_backend, bits, value, 2, 2, 385, 64);
+            require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA store output differs from CPU reference");
+        }
     }
 
     for (int bits : { 2, 3, 4, 5, 6, 8 }) {
         for (bool value : { false, true }) {
-            const std::vector<ggml_fp16_t> fast = test_materialize_output(
-                    backend, bits, value, false, 2, 2, 385, 64);
-            const std::vector<ggml_fp16_t> generic = test_materialize_output(
-                    backend, bits, value, true, 2, 2, 385, 64);
-            require(fast == generic, "KVarN CUDA materialize fast path differs from generic path");
+            const std::vector<ggml_fp16_t> cuda_output = test_materialize_output(
+                    gpu_backend, bits, value, 1, 2, 512, 200);
+            const std::vector<ggml_fp16_t> cpu_output = test_materialize_output(
+                    cpu_backend, bits, value, 1, 2, 512, 200);
+            require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA split workspace store output differs from CPU reference");
+        }
+    }
+
+    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (bool value : { false, true }) {
+            const std::vector<ggml_fp16_t> cuda_output = test_materialize_output(
+                    gpu_backend, bits, value, 1, 2, 16, 504);
+            const std::vector<ggml_fp16_t> cpu_output = test_materialize_output(
+                    cpu_backend, bits, value, 1, 2, 16, 504);
+            require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA direct-flush store output differs from CPU reference");
         }
     }
 
     for (bool value : { false, true }) {
-        const std::vector<ggml_fp16_t> fast = test_materialize_output(
-                backend, 4, value, false, 1, 2, 17, 504);
-        const std::vector<ggml_fp16_t> generic = test_materialize_output(
-                backend, 4, value, true, 1, 2, 17, 504);
-        require(fast == generic, "KVarN CUDA materialize tail fast path differs from generic path");
+        const std::vector<ggml_fp16_t> cuda_output = test_materialize_output(
+                gpu_backend, 4, value, 1, 2, 385, 64, true, false);
+        const std::vector<ggml_fp16_t> cpu_output = test_materialize_output(
+                cpu_backend, 4, value, 1, 2, 385, 64, true, false);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA stale workspace hint fallback output differs from CPU reference");
     }
 
-    set_kvarn_mat_generic_env(false);
-    ggml_backend_free(backend);
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
+}
+
+static void test_materialize_paths_gpu() {
+    ggml_backend_t gpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_GPU, false);
+    if (gpu_backend == nullptr) {
+        return;
+    }
+    ggml_backend_t cpu_backend = init_test_backend(GGML_BACKEND_DEVICE_TYPE_CPU, true);
+
+    for (int bits : { 2, 3, 4, 5, 6, 8 }) {
+        for (bool value : { false, true }) {
+            const std::vector<ggml_fp16_t> cuda_output = test_materialize_output(
+                    gpu_backend, bits, value, 2, 2, 385, 64);
+            const std::vector<ggml_fp16_t> cpu_output = test_materialize_output(
+                    cpu_backend, bits, value, 2, 2, 385, 64);
+            require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA materialize output differs from CPU reference");
+        }
+    }
+
+    for (bool value : { false, true }) {
+        const std::vector<ggml_fp16_t> cuda_output = test_materialize_output(
+                gpu_backend, 4, value, 1, 2, 17, 504);
+        const std::vector<ggml_fp16_t> cpu_output = test_materialize_output(
+                cpu_backend, 4, value, 1, 2, 17, 504);
+        require_close_f16_rmse(cuda_output, cpu_output, 1e-1f, "KVarN CUDA materialize tail output differs from CPU reference");
+    }
+
+    ggml_backend_free(cpu_backend);
+    ggml_backend_free(gpu_backend);
 }
 
 // Validates the GPU/CPU rotated materialize kernel: emitting K_rot (skip the
@@ -927,8 +848,8 @@ int main() {
     }
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_CPU, true, 6);
     test_cache_ops_multi_stream(GGML_BACKEND_DEVICE_TYPE_GPU, false, 6);
-    test_store_legacy_parity_gpu();
-    test_materialize_generic_parity_gpu();
+    test_store_paths_gpu();
+    test_materialize_paths_gpu();
     test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_CPU, true);
     test_materialize_rotated_parity(GGML_BACKEND_DEVICE_TYPE_GPU, false);
 

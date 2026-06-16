@@ -176,7 +176,7 @@ int main(int argc, char ** argv) {
     const std::string cuda_set_rows = read_file(root + "/ggml/src/ggml-cuda/set-rows.cu");
     const std::string cuda_fattn_common = read_file(root + "/ggml/src/ggml-cuda/fattn-common.cuh");
     const std::string cuda_fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
-    const std::string cuda_fattn_kvarn = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
+    const std::string cuda_fattn_kvarn = read_file_optional(root + "/ggml/src/ggml-cuda/fattn-kvarn.cuh");
     const std::string cuda_turbo_quant = read_file(root + "/ggml/src/ggml-cuda/turbo-quant-cuda.cuh");
     const std::string cuda_cmake = read_file(root + "/ggml/src/ggml-cuda/CMakeLists.txt");
     const std::string cuda_fattn_h = read_file(root + "/ggml/src/ggml-cuda/fattn.cuh");
@@ -2708,25 +2708,20 @@ int main(int argc, char ** argv) {
                  ggml_cuda_kvarn.find("KVAR_N_LOWSHMEM_BYTES") != std::string::npos &&
                  ggml_cuda_kvarn.find("kvarn_store_kernel_hishmem") != std::string::npos &&
                  ggml_cuda_kvarn.find("kvarn_store_kernel_lowshmem") != std::string::npos &&
-                 ggml_cuda_kvarn.find("GGML_KVARN_FORCE_LOW_SHMEM") != std::string::npos,
-        "CUDA/HIP KVarN store must keep the high-shared-memory path and provide a force-testable low-shared-memory path");
-    ok &= expect(cuda_fattn_kvarn.find("flash_attn_ext_kvarn_tiled") != std::string::npos &&
-                 cuda_fattn_kvarn.find("FATTN_KVARN_MAX_D") != std::string::npos &&
-                 cuda_fattn_kvarn.find("GGML_KVARN_FUSED_REQUIRE") != std::string::npos &&
-                 cuda_fattn_kvarn.find("k_bits == 4 && v_bits == 4") == std::string::npos &&
-                 cuda_fattn_kvarn.find("Q->ne[0] != FATTN_KVARN_D256") == std::string::npos,
-        "CUDA KVarN fused attention must use a tiled multi-D/multi-bit kernel instead of the old D=256 k4/v4 scalar-load prototype");
-    ok &= expect(cuda_cpp.find("ggml_cuda_flash_attn_ext(*cuda_ctx, node)") != std::string::npos &&
-                 cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_native(ctx, dst)") != std::string::npos &&
-                 cuda_fattn_kvarn.find("ggml_cuda_flash_attn_ext_kvarn_select_splits") != std::string::npos &&
-                 cuda_fattn_kvarn.find("cudaOccupancyMaxActiveBlocksPerMultiprocessor") != std::string::npos &&
-                 cuda_fattn_kvarn.find("4 * n_sm") == std::string::npos,
-        "CUDA KVarN native attention must route through the FlashAttention entry point and use occupancy-aware split selection");
-    ok &= expect(cuda_fattn_kvarn.find("extern __shared__ half tile[]") == std::string::npos &&
-                 cuda_fattn_kvarn.find("FATTN_KVARN_TILE_VALUES * sizeof(half)") == std::string::npos,
-        "CUDA KVarN native attention must not stage full 128x128 K/V tiles in dynamic shared memory");
-    ok &= expect(graph_cpp.find("GGML_KVARN_ROTATED_FA") != std::string::npos &&
-                 graph_cpp.find("kvarn_rotated_fa_enabled") != std::string::npos &&
+                 ggml_cuda_kvarn.find("GGML_KVARN_") == std::string::npos,
+        "CUDA/HIP KVarN store must keep high/low-shared-memory paths without KVarN runtime env knobs");
+    ok &= expect(cuda_fattn_kvarn.empty() &&
+                 cuda_fattn.find("fattn-kvarn.cuh") == std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn") == std::string::npos &&
+                 cuda_fattn_h.find("ggml_cuda_flash_attn_ext_kvarn") == std::string::npos &&
+                 cuda_cpp.find("ggml_cuda_try_fuse_kvarn_fattn") == std::string::npos &&
+                 cuda_cpp.find("ggml_cuda_flash_attn_ext_kvarn_supported") == std::string::npos &&
+                 cuda_cpp.find("GGML_KVARN_FUSED") == std::string::npos &&
+                 cuda_cpp.find("GGML_KVARN_NATIVE_FA") == std::string::npos,
+        "CUDA KVarN native/fused FlashAttention path and route envs must be removed");
+    ok &= expect(graph_cpp.find("GGML_KVARN_FORCE_MATERIALIZE") != std::string::npos &&
+                 graph_cpp.find("kvarn_force_materialize_enabled") != std::string::npos &&
+                 graph_cpp.find("GGML_KVARN_ROTATED_FA") == std::string::npos &&
                  graph_cpp.find("get_k_rotated") != std::string::npos &&
                  graph_cpp.find("get_v_rotated") != std::string::npos &&
                  graph_cpp.find("self_kvarn_rot") != std::string::npos &&
@@ -2742,14 +2737,13 @@ int main(int argc, char ** argv) {
                  kv_cache_kvarn_cpp.find("static const std::vector<float> data = []") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("const auto & data = kvarn_hadamard_128()") != std::string::npos &&
                  kv_cache_kvarn_cpp.find("result->op_params[5] = emit_rotated ? 1 : 0") != std::string::npos &&
-                 cuda_fattn_kvarn.find("ggml_get_op_params_i32(k_mat, 5) != 0") != std::string::npos &&
                  vulkan_cpp.find("const bool emit_rotated = ggml_get_op_params_i32(dst, 5) != 0") != std::string::npos &&
                  vulkan_cpp.find("emit_rotated ? 1u : 0u") != std::string::npos &&
                  vulkan_cpp.find("1.0f / std::sqrt((float)src->ne[0])") != std::string::npos &&
                  vulkan_kvarn_materialize.find("uint emit_rotated") != std::string::npos &&
                  vulkan_kvarn_materialize.find("if (p.emit_rotated != 0u)") != std::string::npos &&
                  vulkan_kvarn_materialize.find("barrier();") != std::string::npos,
-        "KVarN rotated-domain FA must be graph-gated, use rotated materialize accessors, rotate Q/output exactly once, preserve Vulkan FWHT/rotated materialize plumbing, and be rejected by native KVarN FA");
+        "KVarN rotated-domain FA must default on, use one materialize fallback env, rotate Q/output exactly once, and preserve Vulkan FWHT/rotated materialize plumbing");
 
     return ok ? 0 : 1;
 }

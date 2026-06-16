@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <climits>
-#include <cstdlib>
 #include <cstdio>
 #include <mutex>
 #include <vector>
@@ -32,42 +31,15 @@ enum class kvarn_prof_kind : uint8_t {
 };
 
 static bool kvarn_profile_enabled() {
-    static const bool enabled = []() {
-        const char * v = std::getenv("GGML_KVARN_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
+    return false;
 }
 
 static int kvarn_profile_dump_every() {
-    static const int dump_every = []() {
-        const char * v = std::getenv("GGML_KVARN_PROFILE");
-        if (v == nullptr) {
-            return 0;
-        }
-
-        const int parsed = std::atoi(v);
-        return parsed > 1 ? parsed : 0;
-    }();
-    return dump_every;
+    return 0;
 }
 
 static bool kvarn_profile_cuda_graphs_disabled() {
-    static const bool disabled = std::getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
-    return disabled;
-}
-
-static bool kvarn_store_debug_enabled() {
-    static const bool enabled = []() {
-        const char * v = std::getenv("GGML_KVARN_STORE_DEBUG");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-static bool kvarn_materialize_generic_enabled() {
-    const char * v = std::getenv("GGML_KVARN_MAT_GENERIC");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    return false;
 }
 
 struct kvarn_prof_event_pair {
@@ -1850,10 +1822,6 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT((KVAR_N_DIM * bits) % 8 == 0);
     const int n_stream = (int) (stage->ne[2] / (KVAR_N_DIM * KVAR_N_STAGE_GROUPS));
     const int groups_per_stream = (int) (records->ne[2] / n_stream);
-    const char * force_low = std::getenv("GGML_KVARN_FORCE_LOW_SHMEM");
-    const bool force_low_shmem = force_low != nullptr && force_low[0] != '\0' && force_low[0] != '0';
-    const char * legacy = std::getenv("GGML_KVARN_STORE_LEGACY");
-    const bool force_legacy = legacy != nullptr && legacy[0] != '\0' && legacy[0] != '0';
     const size_t smpbo = ggml_cuda_info().devices[ctx.device].smpbo;
     cudaStream_t stream = ctx.stream();
     const int n_heads = (int) current->ne[1];
@@ -1870,16 +1838,12 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const int flush_candidates = workspace_hint ? (tokens_per_stream_hint + KVAR_N_DIM - 1) / KVAR_N_DIM + 3 : 0;
     const bool grid_fits = n_tokens <= 65535 && active_streams * flush_candidates <= 65535;
     const bool use_workspace =
-        !force_legacy &&
-        !force_low_shmem &&
         smpbo >= KVAR_N_SHARED_BYTES &&
         workspace_hint &&
         active_streams > 0 &&
         active_streams <= n_stream &&
         grid_fits;
     const bool use_direct =
-        !force_legacy &&
-        !force_low_shmem &&
         smpbo >= KVAR_N_SHARED_BYTES &&
         direct_hint &&
         active_streams > 0 &&
@@ -1917,17 +1881,6 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             tokens_per_stream_hint,
             active_streams,
             workspace_valid.get());
-        if (kvarn_store_debug_enabled()) {
-            int valid_host = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&valid_host, workspace_valid.get(), sizeof(valid_host), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            if (valid_host == 0) {
-                std::fprintf(stderr,
-                    "ggml-cuda: KVarN workspace store hint mismatch; falling back to legacy store "
-                    "(tokens=%d, hint=%d, streams=%d)\n",
-                    n_tokens, tokens_per_stream_hint, n_stream);
-            }
-        }
         dim3 blocks_stage(n_heads, (n_tokens + KVAR_N_STAGE_CHUNK - 1) / KVAR_N_STAGE_CHUNK, 1);
         kvarn_store_workspace_stage_kernel<<<blocks_stage, KVAR_N_DIM * KVAR_N_STAGE_CHUNK, 0, stream>>>(
             (const float *) current->data,
@@ -2019,7 +1972,7 @@ void ggml_cuda_op_kvarn_store(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         return;
     }
 
-    if (!force_low_shmem && smpbo >= KVAR_N_SHARED_BYTES) {
+    if (smpbo >= KVAR_N_SHARED_BYTES) {
 #if defined(GGML_USE_HIP)
         CUDA_CHECK(hipFuncSetAttribute(
             reinterpret_cast<const void *>(&kvarn_store_kernel_hishmem),
@@ -2104,7 +2057,7 @@ void ggml_cuda_op_kvarn_materialize(ggml_backend_cuda_context & ctx, ggml_tensor
     kvarn_prof_end(prof_live, stream);
 
     auto prof_mat = kvarn_prof_begin(ctx, stream, kvarn_prof_kind::MATERIALIZE, value, bits, (int) dst->ne[2], ggml_nbytes(dst));
-    bool use_fast_materialize = !kvarn_materialize_generic_enabled();
+    bool use_fast_materialize = true;
     if (use_fast_materialize) {
         switch (bits) {
             case 2:
