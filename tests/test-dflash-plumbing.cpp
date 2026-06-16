@@ -2715,6 +2715,15 @@ int main(int argc, char ** argv) {
                  cuda_fattn_kvarn.find("k_bits == 4 && v_bits == 4") == std::string::npos &&
                  cuda_fattn_kvarn.find("Q->ne[0] != FATTN_KVARN_D256") == std::string::npos,
         "CUDA KVarN fused attention must use a tiled multi-D/multi-bit kernel instead of the old D=256 k4/v4 scalar-load prototype");
+    ok &= expect(cuda_cpp.find("ggml_cuda_flash_attn_ext(*cuda_ctx, node)") != std::string::npos &&
+                 cuda_fattn.find("ggml_cuda_flash_attn_ext_kvarn_native(ctx, dst)") != std::string::npos &&
+                 cuda_fattn_kvarn.find("ggml_cuda_flash_attn_ext_kvarn_select_splits") != std::string::npos &&
+                 cuda_fattn_kvarn.find("cudaOccupancyMaxActiveBlocksPerMultiprocessor") != std::string::npos &&
+                 cuda_fattn_kvarn.find("4 * n_sm") == std::string::npos,
+        "CUDA KVarN native attention must route through the FlashAttention entry point and use occupancy-aware split selection");
+    ok &= expect(cuda_fattn_kvarn.find("extern __shared__ half tile[]") == std::string::npos &&
+                 cuda_fattn_kvarn.find("FATTN_KVARN_TILE_VALUES * sizeof(half)") == std::string::npos,
+        "CUDA KVarN native attention must not stage full 128x128 K/V tiles in dynamic shared memory");
 
     return ok ? 0 : 1;
 }

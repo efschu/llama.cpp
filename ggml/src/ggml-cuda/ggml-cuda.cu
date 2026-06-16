@@ -4160,7 +4160,7 @@ static int ggml_cuda_try_fuse_kvarn_fattn(ggml_backend_cuda_context * cuda_ctx, 
         if (v_store != nullptr) {
             ggml_cuda_op_kvarn_store(*cuda_ctx, v_store);
         }
-        ggml_cuda_flash_attn_ext_kvarn(*cuda_ctx, node);
+        ggml_cuda_flash_attn_ext(*cuda_ctx, node);
         return j - i;
     }
 

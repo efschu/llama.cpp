@@ -7445,6 +7445,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
     int  n_kv_heads;
     int  n_kv;
     int  n_stream;
+    int  n_q;
     bool mask;
     bool stress_max;
 
@@ -7457,12 +7458,13 @@ struct test_kvarn_flash_attn_ext : public test_case {
             int n_kv,
             int n_stream,
             bool mask,
-            bool stress_max = false)
+            bool stress_max = false,
+            int n_q = 1)
         : head_dim(head_dim), bits_k(bits_k), bits_v(bits_v), n_q_heads(n_q_heads), n_kv_heads(n_kv_heads),
-          n_kv(n_kv), n_stream(n_stream), mask(mask), stress_max(stress_max) {}
+          n_kv(n_kv), n_stream(n_stream), n_q(n_q), mask(mask), stress_max(stress_max) {}
 
     std::string vars() override {
-        return VARS_TO_STR9(head_dim, bits_k, bits_v, n_q_heads, n_kv_heads, n_kv, n_stream, mask, stress_max);
+        return VARS_TO_STR10(head_dim, bits_k, bits_v, n_q_heads, n_kv_heads, n_kv, n_stream, n_q, mask, stress_max);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7470,7 +7472,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
         const int record_heads = n_kv_heads * slices;
         const int groups_per_stream = test_kvarn_groups_per_stream(0, n_kv);
 
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, 1, n_q_heads, n_stream);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_dim, n_q, n_q_heads, n_stream);
         ggml_set_name(q, "q");
 
         ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, (int64_t) n_kv * n_stream);
@@ -7507,7 +7509,7 @@ struct test_kvarn_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, 1, 1, n_stream);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_q, 1, n_stream);
             ggml_set_name(m, "m");
         }
 
@@ -7524,11 +7526,14 @@ struct test_kvarn_flash_attn_ext : public test_case {
         const int groups_per_stream = test_kvarn_groups_per_stream(0, n_kv);
 
         if (stress_max) {
-            std::vector<float> q_data((size_t) head_dim * n_q_heads * n_stream);
+            std::vector<float> q_data((size_t) head_dim * n_q * n_q_heads * n_stream);
             for (int s = 0; s < n_stream; ++s) {
                 for (int h = 0; h < n_q_heads; ++h) {
-                    for (int d = 0; d < head_dim; ++d) {
-                        q_data[((size_t) s * n_q_heads + h) * head_dim + d] = 4.0f + 0.01f * float(d % 17);
+                    for (int q_col = 0; q_col < n_q; ++q_col) {
+                        for (int d = 0; d < head_dim; ++d) {
+                            q_data[(((size_t) s * n_q_heads + h) * n_q + q_col) * head_dim + d] =
+                                4.0f + 0.01f * float((d + q_col) % 17);
+                        }
                     }
                 }
             }
@@ -8140,6 +8145,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 3, 8, 2, 512, 1, true));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 4, 4, 2, 512, 2, false));
     test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 3, 4, 1, 4096, 1, false, true));
+    test_cases.emplace_back(new test_kvarn_flash_attn_ext(128, 4, 3, 2, 2, 512, 1, true, false, 4));
 
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
