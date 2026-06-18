@@ -517,6 +517,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
                 continue;
             }
+            // empty source tensors: skip (zero elements is semantically "same on all devices")
+            if (ggml_nelements(tensor->src[i]) == 0) {
+                continue;
+            }
             if (ret.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 ret = src_ss[i];
             } else if (!split_states_equal(src_ss[i], ret)) {
@@ -733,6 +737,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_rope = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // empty positions tensor: return src[0] split state
+        if (tensor->src[1] != nullptr && ggml_nelements(tensor->src[1]) == 0) {
+            return src_ss[0];
+        }
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return src_ss[0];
     };
@@ -744,8 +752,17 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         return src_ss[0];
     };
-
     auto handle_flash_attn_ext = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // empty source tensors: return MIRRORED (semantically "same on all devices")
+        if (tensor->src[0] != nullptr && ggml_nelements(tensor->src[0]) == 0) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        if (tensor->src[1] != nullptr && ggml_nelements(tensor->src[1]) == 0) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
+        if (tensor->src[2] != nullptr && ggml_nelements(tensor->src[2]) == 0) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+        }
         GGML_ASSERT(                             src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
         GGML_ASSERT(                             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
@@ -753,7 +770,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
-
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {

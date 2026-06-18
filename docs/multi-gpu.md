@@ -80,17 +80,26 @@ Use only the device listed as `CUDA1` when calling with `--list-devices`.
 ### 4. Tensor parallelism (experimental)
 
 ```bash
+# Basic usage with f16/bf16 KV cache:
 llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
+
+# With quantized KV cache (Q4, Q8, Turbo types):
+# Requires building with GGML_CUDA_FA_HALF_QUANTS=ON for full KV type support
+llama-cli -m model.gguf -sm tensor -ctk q8_0 -ctv q8_0
+llama-cli -m model.gguf -sm tensor -ctk turbo4_0 -ctv turbo4_0
 ```
 
+Requirements and notes:
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
-- KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
+- KV cache quantization works with tensor parallelism. The supported types depend on your build:
+  * **Default build**: `f16`, `bf16`, `q4_0`, `q8_0`, `turbo*` types (matched KV pairs only)
+  * **With `-DGGML_CUDA_FA_HALF_QUANTS=ON`**: All types including `q4_1`, `q5_0`, `q5_1`, `q6_0`, mixed K/V types
+  * **With `-DGGML_CUDA_FA_ALL_QUANTS=ON`**: All K/V type combinations
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
-- `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
-
-  - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
-  - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
-  - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
+- `--split-mode tensor` is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
+  * **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
+  * **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
+  * **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
 
 ### 5. With NCCL
 
@@ -101,6 +110,7 @@ NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU perfor
 ```
 
 When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
+
 ### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
@@ -118,7 +128,7 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | Symptom | How to fix |
 |---|---|
 | Startup error *"SPLIT_MODE_TENSOR requires flash_attn to be enabled"* | Add `-fa on` or remove `-fa off`. |
-| Startup error *"simultaneous use of SPLIT_MODE_TENSOR and KV cache quantization not implemented"* | Use `-ctk f16 -ctv f16` (or `bf16`/`f32`) with `--split-mode tensor`. |
+| Runtime error *"CUDA FA K/V pair was not compiled in this build"* | Rebuild with `-DGGML_CUDA_FA_HALF_QUANTS=ON` for more KV type combinations. |
 | Startup error *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture 'X'"* | Architecture not on the TENSOR allow-list. Use `--split-mode layer`. |
 | Warning *"NCCL is unavailable, multi GPU performance will be suboptimal"* | llama.cpp wasn't built with NCCL. Either accept the lower performance or install NCCL and rebuild. |
 | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
