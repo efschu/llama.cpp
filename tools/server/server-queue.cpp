@@ -202,7 +202,8 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
-                // otherwise, loop again to check sleeping condition
+                // idle timeout: trigger eviction check for disk-tier KV-cache offload
+                callback_update_slots();
             }
         }
     }

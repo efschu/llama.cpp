@@ -603,6 +603,11 @@ struct common_params {
     int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // disk-tier KV-cache offload (server only)
+    std::string cache_disk_path = "";     // directory for .kvc files; empty = disabled
+    float       cache_disk_size_gb = 10.0f; // max disk budget in GiB
+    int32_t     cache_disk_idle_sec = 30;  // seconds in RAM before disk-eviction eligible
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

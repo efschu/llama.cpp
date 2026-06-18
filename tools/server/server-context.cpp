@@ -26,8 +26,13 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
-#include <utility>
 #include <fstream>
+#include <utility>
+#include "disk_io_pool.h"
+#include "kv_disk_cache.h"
+#include <chrono>
+#include <atomic>
+
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -208,6 +213,21 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
+    // ── Disk-tier state ─────────────────────────────────────────────────
+    enum class kv_disk_state {
+        NONE,           // no disk involvement
+        PENDING_WRITE,  // DiskIoPool is writing this slot
+        ON_DISK,        // file exists, RAM buffer freed
+        PENDING_READ,   // request thread is reading file back
+    };
+
+    kv_disk_state disk_state = kv_disk_state::NONE;
+    std::string                disk_path;
+    int64_t                    disk_queued_at = 0;
+    size_t                     disk_kv_bytes = 0;
+    std::unique_ptr<std::mutex> disk_mu;
+    std::unique_ptr<std::atomic<bool>> disk_kv_read_done;
+    std::string                session_id;  // persists across task resets
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -405,13 +425,20 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            // Log disk state transitions on release
+            const auto ds = disk_state;
+            if (ds == server_slot::kv_disk_state::ON_DISK) {
+                SRV_INF("[disk-kv] slot %d released while ON_DISK\n", id);
+            } else if (ds == server_slot::kv_disk_state::PENDING_WRITE) {
+                SRV_WRN("[disk-kv] slot %d released while PENDING_WRITE\n", id);
+            }
+
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
             }
 
             reset();
-
             callback_on_release(id);
         }
     }
@@ -811,6 +838,10 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // Disk-tier KV-cache offload
+    std::unique_ptr<DiskIoPool>  disk_io_pool;
+    std::unique_ptr<KvDiskCache> disk_cache;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();    // Primary: new name
@@ -839,6 +870,15 @@ private:
         mctx = nullptr;
 
         llama_batch_free(batch);
+
+        if (disk_io_pool) {
+            SRV_INF("[disk-kv] shutdown: %.1f MiB in %zu files at %s\n",
+                    disk_cache->used_bytes() / (1024.0 * 1024.0),
+                    disk_cache->slot_count(),
+                    params_base.cache_disk_path.c_str());
+            disk_io_pool.reset();
+            disk_cache.reset();
+        }
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1140,10 +1180,45 @@ private:
         }
 
         // initialize slots
+        // initialize slots (resize instead of emplace_back since server_slot has std::mutex)
+        slots.resize(params_base.n_parallel);
         for (int i = 0; i < params_base.n_parallel; i++) {
-            slots.emplace_back();
+            slots[i].disk_mu = std::make_unique<std::mutex>();
+            slots[i].disk_kv_read_done = std::make_unique<std::atomic<bool>>(false);
         }
 
+        // Warm-start: restore slot states from disk
+        if (disk_cache) {
+            disk_cache->restore_slot_states([&](int slot_id, const std::string & kvc_file,
+                                                 const std::string & tokens_file, size_t n_tokens) {
+                if ((size_t)slot_id >= slots.size()) return;
+                server_slot & sl = slots[slot_id];
+
+                // Load tokens from .tokens file
+                std::vector<llama_token> tokens;
+                try {
+                    std::ifstream tf(tokens_file, std::ios::binary);
+                    if (!tf.is_open()) return;
+                    uint32_t n;
+                    tf.read(reinterpret_cast<char*>(&n), sizeof(n));
+                    if (n > 0 && n < 10000000) {
+                        tokens.resize(n);
+                        tf.read(reinterpret_cast<char*>(tokens.data()), n * sizeof(llama_token));
+                    }
+                } catch (...) {
+                    return;
+                }
+
+                if (tokens.empty()) return;
+
+                sl.prompt.tokens.clear();
+                sl.prompt.tokens.insert(tokens);
+                sl.disk_state = server_slot::kv_disk_state::ON_DISK;
+                sl.disk_path = kvc_file;
+                sl.disk_kv_bytes = 0;
+                SRV_INF("[disk-kv] warm-start: slot %d restored (%zu tokens)\n", slot_id, tokens.size());
+            });
+        }
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -1179,6 +1254,15 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                // Disk-tier: clean up orphaned disk entries when slot is released
+                if (disk_cache) {
+                    server_slot & sl = slots[id_slot];
+                    if (sl.disk_state == server_slot::kv_disk_state::ON_DISK && !sl.disk_path.empty()) {
+                        disk_cache->record_delete_by_path(sl.disk_path);
+                        sl.disk_state = server_slot::kv_disk_state::NONE;
+                        sl.disk_path.clear();
+                    }
+                }
             };
 
             slot.reset();
@@ -1288,6 +1372,19 @@ private:
                 }
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
             }
+        }
+
+        // Initialize disk-tier KV-cache offload
+        if (!params_base.cache_disk_path.empty()) {
+            disk_io_pool = std::make_unique<DiskIoPool>(2);
+            disk_cache   = std::make_unique<KvDiskCache>(params_base.cache_disk_path, params_base.cache_disk_size_gb);
+            disk_cache->init();
+            SRV_INF("[disk-kv] enabled: path=%s budget=%.1f GiB idle_threshold=%ds\n",
+                    params_base.cache_disk_path.c_str(),
+                    params_base.cache_disk_size_gb,
+                    params_base.cache_disk_idle_sec);
+        } else {
+            SRV_INF("srv  %12.*s: [disk-kv] disabled (no --cache-disk-path)\n", 12, __func__);
         }
 
         // populate UI settings (from either new ui_config_json or deprecated webui_config_json)
@@ -1469,6 +1566,20 @@ private:
 
                 SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+
+            // Save session_id to slot for later eviction
+            ret->session_id = task.params.session_id;
+
+            // Disk-tier: handle disk-backed sessions (hot path and cold-start)
+            if (disk_cache) {
+                if (ret->disk_state == server_slot::kv_disk_state::ON_DISK) {
+                    // Hot path: slot was evicted to disk during this run.
+                    // Do NOT delete the disk entry here — the restore path in
+                    // launch_slot_with_task will read the file and clean up.
+                    SRV_INF("[disk-kv] slot %d has disk backup, will restore on launch\n", ret->id);
+                }
+                // Cold-start is handled by restore_slot_states() at startup.
+            }
         }
 
         return ret;
@@ -1477,8 +1588,6 @@ private:
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -1537,6 +1646,65 @@ private:
             slot.lora = params_base.lora_adapters;
         }
 
+        // Disk-tier: restore from disk if slot was evicted
+        if (disk_cache && !slot.disk_path.empty()) {
+            server_slot::kv_disk_state state_snapshot;
+            {
+                std::lock_guard lock(*slot.disk_mu);
+                state_snapshot = slot.disk_state;
+            }
+
+            if (state_snapshot == server_slot::kv_disk_state::PENDING_WRITE) {
+                SRV_INF("[disk-kv] slot %d cancel pending write for incoming request\n", slot.id);
+                {
+                    std::lock_guard lock(*slot.disk_mu);
+                    slot.disk_state = server_slot::kv_disk_state::NONE;
+                }
+                // Wait for worker to finish reading KV cache (llama_state_seq_save_file reads from KV memory)
+                while (!slot.disk_kv_read_done->load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                slot.disk_kv_read_done->store(false, std::memory_order_release);
+                // No restore needed — slot already has KV data in RAM
+            } else if (state_snapshot == server_slot::kv_disk_state::ON_DISK && !slot.disk_path.empty()) {
+                SRV_INF("[disk-kv] slot %d restore start (session=%s, file=%s)\n",
+                        slot.id, slot.session_id.c_str(), slot.disk_path.c_str());
+
+                const std::string filepath = slot.disk_path;
+                {
+                    std::lock_guard lock(*slot.disk_mu);
+                    slot.disk_state = server_slot::kv_disk_state::PENDING_READ;
+                }
+
+                const int64_t t_start = ggml_time_us();
+                llama_tokens tokens;
+                tokens.resize(slot.n_ctx);
+                size_t token_count = 0;
+                const size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot.id, tokens.data(), tokens.size(), &token_count);
+                const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+
+                // Clean up disk entry regardless of success/failure
+                disk_cache->record_delete_by_path(filepath);
+                {
+                    std::lock_guard lock(*slot.disk_mu);
+                    slot.disk_state = server_slot::kv_disk_state::NONE;
+                    slot.disk_path.clear();
+                    slot.disk_kv_bytes = 0;
+                }
+
+                if (nread > 0) {
+                    tokens.resize(token_count);
+                    slot.prompt.tokens.clear();
+                    slot.prompt.tokens.insert(tokens);
+                    SRV_INF("[disk-kv] slot %d restore OK (%zu tokens, %.1f MiB in %.2f ms)\n",
+                            slot.id, token_count, (double)nread / (1024.0 * 1024.0), t_ms);
+                } else {
+                    SRV_ERR("[disk-kv] slot %d restore FAILED — cache invalidated\n", slot.id);
+                    slot.prompt.tokens.clear();
+                }
+            }
+            // PENDING_READ: should not happen (only set during restore above)
+        }
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
         if (lora_all_alora(slot.lora)) {
@@ -2225,7 +2393,111 @@ private:
                                 }
                             }
                         }
-                    }
+                        }
+
+                        // Disk-tier eviction: check all idle slots for disk offload
+                        if (disk_cache && disk_io_pool) {
+                            for (server_slot & sl : slots) {
+                                if (sl.is_processing()) continue;
+                                if (sl.disk_state != server_slot::kv_disk_state::NONE) continue;
+                                if (sl.prompt.n_tokens() == 0) continue;
+
+                                const int64_t idle_us = ggml_time_us() - sl.t_last_used;
+                                const int64_t idle_sec = idle_us / 1000000;
+                                if (idle_sec < params_base.cache_disk_idle_sec) continue;
+
+                                // No session_id check — any idle slot with tokens is eligible
+
+                                const size_t kv_size = llama_state_seq_get_size_ext(sl.ctx_tgt, sl.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (kv_size == 0 || disk_cache->would_exceed_budget(kv_size)) continue;
+                                SLT_INF(sl, "[disk-kv] evicting to disk (%.1f MiB)\n", kv_size / (1024.0 * 1024.0));
+
+                                const std::string file = disk_cache->kvc_path(sl.id);
+                                {
+                                    std::lock_guard lock(*sl.disk_mu);
+                                    sl.disk_state = server_slot::kv_disk_state::PENDING_WRITE;
+                                    sl.disk_path = file;
+                                    sl.disk_queued_at = time(nullptr);
+                                    sl.disk_kv_bytes = kv_size;
+                                }
+
+                                // Capture slot by pointer (slot lives in slots vector)
+                                server_slot * sl_ptr = &sl;
+                                disk_io_pool->enqueue([this, sl_ptr, file]() {
+                                    {
+                                        std::lock_guard lock(*sl_ptr->disk_mu);
+                                        if (sl_ptr->disk_state != server_slot::kv_disk_state::PENDING_WRITE) {
+                                            SRV_INF("[disk-kv] slot %d write cancelled (reactivated before write)\n", sl_ptr->id);
+                                            return;
+                                        }
+                                    }
+
+                                    // Write .tokens file (binary: uint32_t n + llama_token[n])
+                                    const std::string tpath = disk_cache->tokens_path(sl_ptr->id);
+                                    {
+                                        std::vector<llama_token> tokens;
+                                        {
+                                            std::lock_guard lock(*sl_ptr->disk_mu);
+                                            const auto & toks = sl_ptr->prompt.tokens.get_tokens();
+                                            tokens = toks;
+                                        }
+                                        std::ofstream tf(tpath, std::ios::binary | std::ios::trunc);
+                                        uint32_t n = static_cast<uint32_t>(tokens.size());
+                                        tf.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                                        if (n > 0) {
+                                            tf.write(reinterpret_cast<const char*>(tokens.data()), n * sizeof(llama_token));
+                                        }
+                                        if (!tf.good()) {
+                                            SRV_ERR("[disk-kv] slot %d .tokens write failed — aborting eviction\n", sl_ptr->id);
+                                            std::lock_guard lock(*sl_ptr->disk_mu);
+                                            sl_ptr->disk_state = server_slot::kv_disk_state::NONE;
+                                            sl_ptr->disk_path.clear();
+                                            return;
+                                        }
+                                    }
+
+                                    const int64_t t_start = ggml_time_us();
+                                    const size_t written = llama_state_seq_save_file(sl_ptr->ctx_tgt, file.c_str(), sl_ptr->id, nullptr, 0);
+                                    // Signal that KV cache read is complete — safe for request thread to write
+                                    sl_ptr->disk_kv_read_done->store(true, std::memory_order_release);
+                                    if (written > 0) {
+                                        SRV_INF("[disk-kv] wrote %s (%.1f MiB in %.2f ms)\n",
+                                                file.c_str(),
+                                                (double)written / (1024.0 * 1024.0),
+                                                (ggml_time_us() - t_start) / 1000.0);
+
+                                        // Cancellation check AFTER write
+                                        {
+                                            std::lock_guard lock(*sl_ptr->disk_mu);
+                                            if (sl_ptr->disk_state != server_slot::kv_disk_state::PENDING_WRITE) {
+                                                SRV_INF("[disk-kv] slot %d write cancelled (reactivated mid-write)\n", sl_ptr->id);
+                                                std::filesystem::remove(file);
+                                                return;
+                                            }
+                                        }
+
+                                        disk_cache->record_write(sl_ptr->id, file, disk_cache->tokens_path(sl_ptr->id), written, sl_ptr->disk_queued_at, sl_ptr->prompt.n_tokens());
+                                        {
+                                            std::lock_guard lock(*sl_ptr->disk_mu);
+                                            sl_ptr->disk_state = server_slot::kv_disk_state::ON_DISK;
+                                        }
+                                        // NOTE: do NOT call common_context_seq_rm here.
+                                        // prompt.tokens is needed for restore in launch_slot_with_task.
+                                        // The KV cache is preserved in memory after llama_state_seq_save_file().
+                                        // The next request on this slot will either restore from disk
+                                        // (overwriting prompt.tokens) or tokenize a new prompt
+                                        // (which also overwrites prompt.tokens).
+                                    } else {
+                                        SRV_ERR("[disk-kv] failed to write %s\n", file.c_str());
+                                        {
+                                            std::lock_guard lock(*sl_ptr->disk_mu);
+                                            sl_ptr->disk_state = server_slot::kv_disk_state::NONE;
+                                            sl_ptr->disk_path.clear();
+                                        }
+                                    }
+                                });
+                            }
+                        }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
@@ -2493,6 +2765,117 @@ private:
 
             if (all_idle) {
                 SRV_INF("%s", "all slots are idle\n");
+
+                // Disk-tier eviction: check all idle slots for disk offload
+                if (disk_cache && disk_io_pool) {
+                    for (server_slot & sl : slots) {
+                        if (sl.disk_state != server_slot::kv_disk_state::NONE) continue;
+                        if (sl.prompt.n_tokens() == 0) continue;
+                        // No session_id check — any idle slot with tokens is eligible
+
+                        const int64_t idle_us = ggml_time_us() - sl.t_last_used;
+                        const int64_t idle_sec = idle_us / 1000000;
+                        if (idle_sec < params_base.cache_disk_idle_sec) continue;
+
+                        const size_t kv_size = llama_state_seq_get_size_ext(sl.ctx_tgt, sl.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        if (kv_size == 0 || disk_cache->would_exceed_budget(kv_size)) continue;
+
+                        SLT_INF(sl, "[disk-kv] evicting to disk (%.1f MiB)\n", kv_size / (1024.0 * 1024.0));
+
+                        const std::string file = disk_cache->kvc_path(sl.id);
+                        {
+                            std::lock_guard lock(*sl.disk_mu);
+                            sl.disk_state = server_slot::kv_disk_state::PENDING_WRITE;
+                            sl.disk_path = file;
+                            sl.disk_queued_at = time(nullptr);
+                            sl.disk_kv_bytes = kv_size;
+                        }
+
+                        server_slot * sl_ptr = &sl;
+                        disk_io_pool->enqueue([this, sl_ptr, file]() {
+                            // Write .tokens file (binary: uint32_t n + llama_token[n])
+                            const std::string tpath = disk_cache->tokens_path(sl_ptr->id);
+                            {
+                                std::vector<llama_token> tokens;
+                                {
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    const auto & toks = sl_ptr->prompt.tokens.get_tokens();
+                                    tokens = toks;
+                                }
+                                std::ofstream tf(tpath, std::ios::binary | std::ios::trunc);
+                                uint32_t n = static_cast<uint32_t>(tokens.size());
+                                tf.write(reinterpret_cast<const char*>(&n), sizeof(n));
+                                if (n > 0) {
+                                    tf.write(reinterpret_cast<const char*>(tokens.data()), n * sizeof(llama_token));
+                                }
+                                if (!tf.good()) {
+                                    SRV_ERR("[disk-kv] slot %d .tokens write failed — aborting eviction\n", sl_ptr->id);
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    sl_ptr->disk_state = server_slot::kv_disk_state::NONE;
+                                    sl_ptr->disk_path.clear();
+                                    return;
+                                }
+                            }
+
+                            const int64_t t_start = ggml_time_us();
+                            const size_t written = llama_state_seq_save_file(sl_ptr->ctx_tgt, file.c_str(), sl_ptr->id, nullptr, 0);
+                            // Signal that KV cache read is complete — safe for request thread to write
+                            sl_ptr->disk_kv_read_done->store(true, std::memory_order_release);
+                            if (written > 0) {
+                                SRV_INF("[disk-kv] wrote %s (%.1f MiB in %.2f ms)\n",
+                                        file.c_str(),
+                                        (double)written / (1024.0 * 1024.0),
+                                        (ggml_time_us() - t_start) / 1000.0);
+
+                                // Cancellation check AFTER write
+                                {
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    if (sl_ptr->disk_state != server_slot::kv_disk_state::PENDING_WRITE) {
+                                        SRV_INF("[disk-kv] slot %d write cancelled (reactivated mid-write)\n", sl_ptr->id);
+                                        std::filesystem::remove(file);
+                                        return;
+                                    }
+                                }
+
+                                // Free KV cells from RAM — this does NOT touch prompt.tokens.
+                                // We hold tokens in a local copy first so they survive the rm.
+                                {
+                                    common_context_seq_rm(sl_ptr->ctx_tgt, sl_ptr->id, -1, -1);
+                                    if (sl_ptr->ctx_dft) {
+                                        common_context_seq_rm(sl_ptr->ctx_dft, sl_ptr->id, -1, -1);
+                                    }
+                                }
+                                disk_cache->record_write(sl_ptr->id, file, disk_cache->tokens_path(sl_ptr->id), written, sl_ptr->disk_queued_at, sl_ptr->prompt.n_tokens());
+                                {
+                                    std::lock_guard lock(*sl_ptr->disk_mu);
+                                    sl_ptr->disk_state = server_slot::kv_disk_state::ON_DISK;
+                                }
+                            } else {
+                                std::lock_guard lock(*sl_ptr->disk_mu);
+                                sl_ptr->disk_state = server_slot::kv_disk_state::NONE;
+                                sl_ptr->disk_path.clear();
+                            }
+                         });
+                    }
+                    // Cleanup: remove orphaned disk entries for slots that are ON_DISK
+                    // but have been idle for a long time (2x the idle threshold)
+                    for (server_slot & sl : slots) {
+                        if (sl.disk_state != server_slot::kv_disk_state::ON_DISK) continue;
+                        if (sl.disk_path.empty()) continue;
+
+                        const int64_t idle_us = ggml_time_us() - sl.t_last_used;
+                        const int64_t idle_sec = idle_us / 1000000;
+                        if (idle_sec < 2 * params_base.cache_disk_idle_sec) continue;
+
+                        SRV_DBG("[disk-kv] slot %d cleanup orphaned disk entry after %lds idle\n", sl.id, idle_sec);
+                        disk_cache->record_delete_by_path(sl.disk_path);
+                        {
+                            std::lock_guard lock(*sl.disk_mu);
+                            sl.disk_state = server_slot::kv_disk_state::NONE;
+                            sl.disk_path.clear();
+                        }
+                    }
+                }
 
                 return;
             }
